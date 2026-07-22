@@ -66,4 +66,6 @@
 
 #@hasgeom@ R__HAS_GEOM /**/
 
+#@haslhc4codec@ R__HAS_LHC4CODEC /**/
+
 #endif

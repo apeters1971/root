@@ -13,6 +13,9 @@
 #include "ZipLZMA.h"
 #include "ZipLZ4.h"
 #include "ZipZSTD.h"
+#ifdef R__HAS_LHC4CODEC
+#include "ZipLHC4.h"
+#endif
 
 #include "zlib.h"
 
@@ -99,6 +102,10 @@ void R__zipMultipleAlgorithm(int cxlevel, int *srcsize, const char *src, int *tg
      R__zipLZ4(cxlevel, srcsize, src, tgtsize, tgt, irep);
   } else if (compressionAlgorithm == ROOT::RCompressionSetting::EAlgorithm::kZSTD) {
      R__zipZSTD(cxlevel, srcsize, src, tgtsize, tgt, irep);
+#ifdef R__HAS_LHC4CODEC
+  } else if (compressionAlgorithm == ROOT::RCompressionSetting::EAlgorithm::kLHC4) {
+     R__zipLHC4(cxlevel, srcsize, src, tgtsize, tgt, irep);
+#endif
   } else if (compressionAlgorithm == ROOT::RCompressionSetting::EAlgorithm::kOldCompressionAlgo || compressionAlgorithm == ROOT::RCompressionSetting::EAlgorithm::kUseGlobal) {
      R__zipOld(cxlevel, srcsize, src, tgtsize, tgt, irep);
   } else {
@@ -266,10 +273,21 @@ static int is_valid_header_zstd(const unsigned char *src)
    return src[0] == 'Z' && src[1] == 'S' && src[2] == '\1';
 }
 
+#ifdef R__HAS_LHC4CODEC
+static int is_valid_header_lhc4(const unsigned char *src)
+{
+   return src[0] == 'L' && src[1] == 'C' && src[2] == '\1';
+}
+#endif
+
 static int is_valid_header(const unsigned char *src)
 {
    return is_valid_header_zlib(src) || is_valid_header_old(src) || is_valid_header_lzma(src) ||
-          is_valid_header_lz4(src) || is_valid_header_zstd(src);
+          is_valid_header_lz4(src) || is_valid_header_zstd(src)
+#ifdef R__HAS_LHC4CODEC
+          || is_valid_header_lhc4(src)
+#endif
+          ;
 }
 
 ROOT::RCompressionSetting::EAlgorithm::EValues R__getCompressionAlgorithm(const unsigned char *buf, size_t bufsize)
@@ -279,6 +297,10 @@ ROOT::RCompressionSetting::EAlgorithm::EValues R__getCompressionAlgorithm(const 
 
    if (is_valid_header_zstd(const_cast<unsigned char *>(buf)))
       return ROOT::RCompressionSetting::EAlgorithm::kZSTD;
+#ifdef R__HAS_LHC4CODEC
+   if (is_valid_header_lhc4(const_cast<unsigned char *>(buf)))
+      return ROOT::RCompressionSetting::EAlgorithm::kLHC4;
+#endif
    if (is_valid_header_zlib(const_cast<unsigned char *>(buf)))
       return ROOT::RCompressionSetting::EAlgorithm::kZLIB;
    if (is_valid_header_lz4(const_cast<unsigned char *>(buf)))
@@ -383,6 +405,11 @@ void R__unzip(int *srcsize, const uch *src, int *tgtsize, uch *tgt, int *irep)
    } else if (is_valid_header_zstd(src)) {
       R__unzipZSTD(srcsize, src, tgtsize, tgt, irep);
       return;
+#ifdef R__HAS_LHC4CODEC
+   } else if (is_valid_header_lhc4(src)) {
+      R__unzipLHC4(srcsize, src, tgtsize, tgt, irep);
+      return;
+#endif
    }
 
    /* Old zlib format */

@@ -317,6 +317,19 @@ if(builtin_lz4)
   add_subdirectory(builtins/lz4)
 endif()
 
+#---Check for LHC4CODEC--------------------------------------------------------------
+set(LHC4CODEC_SOURCE_DIR "" CACHE PATH
+    "Optional path to an lhc4codec checkout; if empty and builtin_lhc4codec=ON, the source is git-cloned")
+
+if(lhc4codec)
+  if(builtin_lhc4codec)
+    list(APPEND ROOT_BUILTINS LHC4CODEC)
+    add_subdirectory(builtins/lhc4codec)
+  else()
+    find_package(LHC4CODEC REQUIRED)
+  endif()
+endif()
+
 #---Check for X11 which is mandatory lib on Unix--------------------------------------
 if(x11)
   message(STATUS "Looking for X11")
