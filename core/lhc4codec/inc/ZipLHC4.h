@@ -19,16 +19,23 @@ enum {
    kLHC4CodecBwt = 1,
    kLHC4CodecZstd = 2,
    kLHC4CodecBzip3 = 3,
+   kLHC4CodecLzma = 4,
+   kLHC4CodecAuto = 5,
 };
 
 void R__zipLHC4(int cxlevel, int *srcsize, const char *src, int *tgtsize, char *tgt, int *irep);
 void R__unzipLHC4(int *srcsize, const unsigned char *src, int *tgtsize, unsigned char *tgt, int *irep);
 
-/// Select the lhc4codec backend (Lz, Bwt, Zstd, Bzip3). Defaults to Lz.
+/// Select the lhc4codec backend (Lz, Bwt, Zstd, Bzip3, Lzma, Auto). Defaults to Lz.
 void R__SetLHC4Codec(int codec);
 int R__GetLHC4Codec(void);
 /// Returns 1 when the requested backend was linked into lhc4codec, else 0.
+/// Auto is always available; it races whichever optional backends are linked.
 int R__LHC4CodecAvailable(int codec);
+
+/// Auto only: min % size gain to prefer a slower decoder (default 1). 0 = smallest wins.
+void R__SetLHC4AutoMinGainPct(int pct);
+int R__GetLHC4AutoMinGainPct(void);
 
 /// Enable lhc4codec byte filters (shuffle/delta/zigzag/dict) for columnar data.
 void R__SetLHC4Filters(int enable);

@@ -167,4 +167,25 @@ TEST(RNTupleZip, LHC4ExternalCodec)
    EXPECT_EQ(data, std::string_view(unzipBuffer.get(), data.length()));
    R__SetLHC4Codec(kLHC4CodecLz);
 }
+
+TEST(RNTupleZip, LHC4Auto)
+{
+   R__SetLHC4Codec(kLHC4CodecAuto);
+   R__SetLHC4AutoMinGainPct(1);
+   R__SetLHC4Filters(1);
+   std::vector<std::uint32_t> column(1024);
+   for (std::size_t i = 0; i < column.size(); ++i)
+      column[i] = static_cast<std::uint32_t>(i);
+   const auto *data = reinterpret_cast<const char *>(column.data());
+   const auto dataLen = column.size() * sizeof(std::uint32_t);
+   const int compression = ROOT::CompressionSettings(ROOT::RCompressionSetting::EAlgorithm::kLHC4, 5);
+   auto zipBuffer = std::unique_ptr<char[]>(new char[dataLen]);
+   auto szZipped = RNTupleCompressor::Zip(data, dataLen, compression, zipBuffer.get());
+   EXPECT_LT(szZipped, dataLen);
+   auto unzipBuffer = std::unique_ptr<char[]>(new char[dataLen]);
+   RNTupleDecompressor::Unzip(zipBuffer.get(), szZipped, dataLen, unzipBuffer.get());
+   EXPECT_EQ(0, std::memcmp(data, unzipBuffer.get(), dataLen));
+   R__SetLHC4Codec(kLHC4CodecLz);
+   R__SetLHC4Filters(0);
+}
 #endif

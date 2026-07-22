@@ -43,7 +43,7 @@ namespace ROOT {
 ///  - LZ4 is recommended to be used with compression level 4 [404]
 ///  - ZSTD is recommended to be used with compression level 5 [505]
 ///  - LHC4 is recommended to be used with compression level 6 [606]
-///  - LHC4 backends (Lz, Bwt, Zstd, Bzip3) and filter options are toggled
+///  - LHC4 backends (Lz, Bwt, Zstd, Bzip3, Lzma, Auto) and filter options are toggled
 ///    globally via R__SetLHC4Codec(), R__SetLHC4Filters(), and related helpers
 ///    before compression (see ZipLHC4.h). Decompression auto-detects the inner
 ///    frame type.

@@ -73,6 +73,7 @@ Re-encode an RNTuple with different page compressors:
   <outputBase>_lhc4_bzip3.root   lhc4codec filters + bzip3 (level 5)
   <outputBase>_lhc4_lz5.root     lhc4codec filters + native LZ (level 5)
   <outputBase>_lhc4_bwt5.root    lhc4codec filters + BWT (level 5)
+  <outputBase>_lhc4_auto.root    lhc4codec filters + Auto codec race (level 5, 1% min gain)
 
 By default, LHC4 variants disable ROOT column encodings (plain columns) and enable
 lhc4codec byte filters (shuffle/delta/zigzag/dict/RLE as applicable). Use
@@ -422,6 +423,7 @@ void ResetLHC4Globals()
    R__SetLHC4FilterFallback(1);
    R__SetLHC4FilterRle(1);
    R__SetLHC4FilterDict(1);
+   R__SetLHC4AutoMinGainPct(1);
 }
 
 RNTupleWriteOptions MakeLHC4WriteOptions(int level, bool keepColumnEncoding)
@@ -497,6 +499,7 @@ std::vector<Variant> MakeVariants(const RunOptions &runOpts)
    variants.push_back({"lhc4_bzip3", "_lhc4_bzip3", lhc4Opts, true, true, kLHC4CodecBzip3, true});
    variants.push_back({"lhc4_lz5", "_lhc4_lz5", lhc4Opts, true, true, kLHC4CodecLz, false});
    variants.push_back({"lhc4_bwt5", "_lhc4_bwt5", lhc4Opts, true, true, kLHC4CodecBwt, false});
+   variants.push_back({"lhc4_auto", "_lhc4_auto", lhc4Opts, true, true, kLHC4CodecAuto, false});
 #endif
 
    for (auto &variant : variants)

@@ -119,9 +119,12 @@ They follow the same global pattern as `R__SetZipMode()` for the default codec.
 | `kLHC4CodecBwt` (1) | Native LHC4 BWT block mode |
 | `kLHC4CodecZstd` (2) | Native zstd frames (if linked) |
 | `kLHC4CodecBzip3` (3) | Native bzip3 frames (if linked) |
+| `kLHC4CodecLzma` (4) | Native xz/LZMA frames (if linked) |
+| `kLHC4CodecAuto` (5) | Race available codecs at the chosen level |
 
-Query availability with `R__LHC4CodecAvailable(codec)`. `R__SetLHC4Bwt(1/0)` remains
-as a convenience alias for switching between Lz and Bwt.
+Query availability with `R__LHC4CodecAvailable(codec)`. `Auto` is always available;
+optional backends (Zstd, Bzip3, Lzma) must be linked for them to participate in the
+race. `R__SetLHC4Bwt(1/0)` remains as a convenience alias for switching between Lz and Bwt.
 
 ### Byte filters (Lz/Bwt only)
 
@@ -159,7 +162,8 @@ R__SetLHC4Filters(0);           // filters are ignored for zstd/bzip3
 
 | API | Default | Effect |
 |-----|---------|--------|
-| `R__SetLHC4Codec(int)` | Lz | Select Lz / Bwt / Zstd / Bzip3 backend |
+| `R__SetLHC4Codec(int)` | Lz | Select Lz / Bwt / Zstd / Bzip3 / Lzma / Auto backend |
+| `R__SetLHC4AutoMinGainPct(int)` | 1 | Auto only: min % gain to prefer a slower decoder |
 | `R__SetLHC4Filters(int)` | off | Auto-detect + apply byte transforms |
 | `R__SetLHC4FilterFallback(int)` | on | With filters: also compress raw and keep smaller |
 | `R__SetLHC4FilterRle(int)` | on | Try byte-RLE on filter/intermediate path |
@@ -176,7 +180,9 @@ Getters: `R__GetLHC4*()` for each setter above, plus `R__LHC4CodecAvailable()`.
 - **Filters**: physics branches with integers/floats stored column-wise in pages.
 - **Filter RLE**: repetitive filtered bytes (long zero runs in shuffled columns).
 - **BWT / Bwt codec**: repetitive or text-like payloads where the LZ path is less effective.
-- **Zstd / Bzip3**: when you want native frames from those tools inside ROOT's LC wrapper.
+- **Zstd / Bzip3 / Lzma**: when you want native frames from those tools inside ROOT's LC wrapper.
+- **Auto**: benchmark-style codec selection; races linked backends and picks a decode-speed-aware
+  winner (`R__SetLHC4AutoMinGainPct`, default 1%).
 
 Decompression does **not** need these flags; the inner frame type and filter path are
 restored automatically on read.

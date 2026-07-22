@@ -27,6 +27,7 @@ static int R__LHC4Filters = 0;
 static int R__LHC4FilterFallback = 1;
 static int R__LHC4FilterRle = 1;
 static int R__LHC4FilterDict = 1;
+static int R__LHC4AutoMinGainPct = 1;
 
 static lhc4codec::Codec ToLHC4Codec(int codec)
 {
@@ -34,6 +35,8 @@ static lhc4codec::Codec ToLHC4Codec(int codec)
    case kLHC4CodecBwt: return lhc4codec::Codec::Bwt;
    case kLHC4CodecZstd: return lhc4codec::Codec::Zstd;
    case kLHC4CodecBzip3: return lhc4codec::Codec::Bzip3;
+   case kLHC4CodecLzma: return lhc4codec::Codec::Lzma;
+   case kLHC4CodecAuto: return lhc4codec::Codec::Auto;
    default: return lhc4codec::Codec::Lz;
    }
 }
@@ -51,6 +54,16 @@ extern "C" int R__GetLHC4Codec(void)
 extern "C" int R__LHC4CodecAvailable(int codec)
 {
    return lhc4codec::codec_available(ToLHC4Codec(codec)) ? 1 : 0;
+}
+
+extern "C" void R__SetLHC4AutoMinGainPct(int pct)
+{
+   R__LHC4AutoMinGainPct = pct;
+}
+
+extern "C" int R__GetLHC4AutoMinGainPct(void)
+{
+   return R__LHC4AutoMinGainPct;
 }
 
 extern "C" void R__SetLHC4Filters(int enable)
@@ -119,6 +132,7 @@ static lhc4codec::CompressParams MakeLHC4CompressParams(int cxlevel)
    params.filter_fallback = R__LHC4FilterFallback != 0;
    params.filter_rle = R__LHC4FilterRle != 0;
    params.filter_dict = R__LHC4FilterDict != 0;
+   params.auto_min_gain_pct = R__LHC4AutoMinGainPct;
    return params;
 }
 
