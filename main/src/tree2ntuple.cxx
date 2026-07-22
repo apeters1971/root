@@ -51,6 +51,8 @@ Options:
                            Columns start with small pages and grow up to this limit.
   --initial-page-size N    Advanced: set the initial unzipped page size in bytes (default: 256 B).
                            Only needed for micro-benchmarks; large values require much more memory.
+  --auto-min-gain N        Min % size gain for lhc4codec Auto to prefer a slower decoder
+                           (default: 1). 0 = always pick the smallest payload.
   --jobs N                 Run up to N variants in parallel (default: 1). Use 0 for auto
                            (number of CPU threads, capped by variant count). Requires fork().
   --quiet                  Suppress per-variant progress (used for parallel workers).
@@ -66,7 +68,7 @@ Convert a TTree into RNTuple files:
   <outputBase>_lhc4_bzip3.root   lhc4codec filters + bzip3 (level 5)
   <outputBase>_lhc4_lz5.root     lhc4codec filters + native LZ (level 5)
   <outputBase>_lhc4_bwt5.root    lhc4codec filters + BWT (level 5)
-  <outputBase>_lhc4_auto.root    lhc4codec filters + Auto codec race (level 5, 1% min gain)
+  <outputBase>_lhc4_auto.root    lhc4codec filters + Auto codec race (level 5; see --auto-min-gain)
 
 By default, LHC4 variants disable ROOT column encodings (plain columns) and enable
 lhc4codec byte filters (shuffle/delta/zigzag/dict/RLE as applicable). Use
@@ -85,6 +87,7 @@ struct RunOptions {
    int fJobs = 1;
    std::optional<std::size_t> fPageSize;
    std::optional<std::size_t> fInitialPageSize;
+   std::optional<int> fAutoMinGainPct;
    std::string fOnlyVariant;
    std::string fWorkerResult;
    std::string fInputFile;
@@ -290,6 +293,16 @@ RunOptions ParseArgs(int argc, char **argv)
          opts.fInitialPageSize = static_cast<std::size_t>(std::stoull(arg.substr(20)));
          continue;
       }
+      if (arg == "--auto-min-gain") {
+         if (i + 1 >= argc)
+            throw std::runtime_error("--auto-min-gain requires an argument");
+         opts.fAutoMinGainPct = std::stoi(argv[++i]);
+         continue;
+      }
+      if (arg.rfind("--auto-min-gain=", 0) == 0) {
+         opts.fAutoMinGainPct = std::stoi(arg.substr(16));
+         continue;
+      }
       // Deprecated alias kept for compatibility with the first implementation.
       if (arg == "--max-page-size") {
          if (i + 1 >= argc)
@@ -364,8 +377,15 @@ RunOptions ParseArgs(int argc, char **argv)
       throw std::runtime_error("--initial-page-size must be > 0");
    if (opts.fPageSize && opts.fInitialPageSize && *opts.fInitialPageSize > *opts.fPageSize)
       throw std::runtime_error("--initial-page-size must not exceed --page-size");
+   if (opts.fAutoMinGainPct && *opts.fAutoMinGainPct < 0)
+      throw std::runtime_error("--auto-min-gain must be >= 0");
 
    return opts;
+}
+
+int ResolveAutoMinGainPct(const RunOptions &opts)
+{
+   return opts.fAutoMinGainPct ? *opts.fAutoMinGainPct : 1;
 }
 
 void ApplyPageSizeOptions(RNTupleWriteOptions &writeOpts, const RunOptions &runOpts)
@@ -411,15 +431,23 @@ void AppendPageSizeArgs(std::vector<std::string> &args, const RunOptions &opts)
    }
 }
 
+void AppendAutoMinGainArgs(std::vector<std::string> &args, const RunOptions &opts)
+{
+   if (opts.fAutoMinGainPct) {
+      args.emplace_back("--auto-min-gain");
+      args.push_back(std::to_string(*opts.fAutoMinGainPct));
+   }
+}
+
 #ifdef R__HAS_LHC4CODEC
-void ResetLHC4Globals()
+void ResetLHC4Globals(int autoMinGainPct)
 {
    R__SetLHC4Codec(kLHC4CodecLz);
    R__SetLHC4Filters(0);
    R__SetLHC4FilterFallback(1);
    R__SetLHC4FilterRle(1);
    R__SetLHC4FilterDict(1);
-   R__SetLHC4AutoMinGainPct(1);
+   R__SetLHC4AutoMinGainPct(autoMinGainPct);
 }
 
 RNTupleWriteOptions MakeLHC4WriteOptions(int level, bool keepColumnEncoding)
@@ -430,9 +458,9 @@ RNTupleWriteOptions MakeLHC4WriteOptions(int level, bool keepColumnEncoding)
    return opts;
 }
 
-void ConfigureLHC4FilterGlobals(int codec, bool enableByteFilters)
+void ConfigureLHC4FilterGlobals(int codec, bool enableByteFilters, int autoMinGainPct)
 {
-   ResetLHC4Globals();
+   ResetLHC4Globals(autoMinGainPct);
    R__SetLHC4Codec(codec);
    if (enableByteFilters)
       R__SetLHC4Filters(1);
@@ -514,7 +542,8 @@ const Variant *FindVariant(const std::vector<Variant> &variants, const std::stri
 }
 
 std::optional<VariantResult> ImportVariant(const std::string &inputFile, const std::string &treeName,
-                                           const std::string &outputFile, const Variant &variant, bool quiet)
+                                           const std::string &outputFile, const Variant &variant, bool quiet,
+                                           int autoMinGainPct)
 {
 #ifdef R__HAS_LHC4CODEC
    if (variant.fUsesLHC4Globals) {
@@ -523,9 +552,9 @@ std::optional<VariantResult> ImportVariant(const std::string &inputFile, const s
             std::cerr << "Skipping " << variant.fLabel << ": lhc4codec backend is not available in this build\n";
          return std::nullopt;
       }
-      ConfigureLHC4FilterGlobals(variant.fLHC4Codec, variant.fEnableLHC4ByteFilters);
+      ConfigureLHC4FilterGlobals(variant.fLHC4Codec, variant.fEnableLHC4ByteFilters, autoMinGainPct);
    } else {
-      ResetLHC4Globals();
+      ResetLHC4Globals(autoMinGainPct);
    }
 #else
    if (variant.fUsesLHC4Globals) {
@@ -611,6 +640,7 @@ void PrintSummaryTable(const RunOptions &opts, std::uint64_t inputBytes,
    std::cout << "Input size: " << FormatBytes(inputBytes) << '\n';
    std::cout << "Output base: " << opts.fOutputBase << '\n';
    std::cout << "Page size: " << FormatPageSizeSettings(opts) << '\n';
+   std::cout << "Auto min gain: " << ResolveAutoMinGainPct(opts) << "%\n";
    std::cout << '\n';
 
    const std::uint64_t nativeZstdBytes = FindNativeZstdOutputBytes(results);
@@ -650,7 +680,7 @@ std::vector<VariantResult> RunSequential(const RunOptions &opts)
    std::vector<VariantResult> results;
    for (const auto &variant : MakeVariants(opts)) {
       if (auto row = ImportVariant(opts.fInputFile, opts.fTreeName, JoinPath(opts.fOutputBase, variant.fSuffix),
-                                   variant, opts.fQuiet)) {
+                                   variant, opts.fQuiet, ResolveAutoMinGainPct(opts))) {
          results.push_back(*row);
       }
    }
@@ -671,6 +701,7 @@ std::vector<std::string> BuildWorkerArgv(const char *executable, const RunOption
    if (opts.fKeepColumnEncoding)
       args.emplace_back("--keep-column-encoding");
    AppendPageSizeArgs(args, opts);
+   AppendAutoMinGainArgs(args, opts);
    args.push_back(opts.fInputFile);
    args.push_back(opts.fTreeName);
    args.push_back(opts.fOutputBase);
@@ -807,7 +838,7 @@ int RunWorkerMode(const RunOptions &opts)
 
    const bool quiet = !opts.fWorkerResult.empty();
    auto result = ImportVariant(opts.fInputFile, opts.fTreeName, JoinPath(opts.fOutputBase, variant->fSuffix), *variant,
-                               quiet);
+                               quiet, ResolveAutoMinGainPct(opts));
    if (!result)
       return 1;
 
@@ -835,6 +866,8 @@ int RunMain(const RunOptions &opts, const char *executable)
       std::cout << "Using ROOT column encodings + lhc4codec backend for LHC4 variants\n";
    if ((opts.fPageSize || opts.fInitialPageSize) && !opts.fQuiet)
       std::cout << "Page size: " << FormatPageSizeSettings(opts) << '\n';
+   if (!opts.fQuiet)
+      std::cout << "Auto min gain: " << ResolveAutoMinGainPct(opts) << "%\n";
 
    std::vector<VariantResult> results;
 #if defined(_WIN32)
