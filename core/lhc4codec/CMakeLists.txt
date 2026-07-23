@@ -3,7 +3,9 @@
 ############################################################################
 
 add_library(ROOTLHC4Zip OBJECT src/ZipLHC4.cxx)
-set_target_properties(ROOTLHC4Zip PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+set_target_properties(ROOTLHC4Zip PROPERTIES
+  CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF
+  POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(ROOTLHC4Zip PRIVATE LHC4CODEC::LHC4CODEC)
 target_include_directories(ROOTLHC4Zip
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/inc>
