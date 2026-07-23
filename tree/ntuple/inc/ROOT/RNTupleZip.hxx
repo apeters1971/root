@@ -30,61 +30,6 @@ namespace Internal {
 
 // clang-format off
 /**
-\class ROOT::Internal::RNTupleCompressor
-\ingroup NTuple
-\brief Helper class to compress data blocks in the ROOT compression frame format
-*/
-// clang-format on
-class RNTupleCompressor {
-public:
-   RNTupleCompressor() = delete;
-   RNTupleCompressor(const RNTupleCompressor &other) = delete;
-   RNTupleCompressor &operator=(const RNTupleCompressor &other) = delete;
-   RNTupleCompressor(RNTupleCompressor &&other) = delete;
-   RNTupleCompressor &operator=(RNTupleCompressor &&other) = delete;
-
-   /// Returns the size of the compressed data, written into the provided output buffer.
-   static std::size_t Zip(const void *from, std::size_t nbytes, int compression, void *to)
-   {
-      R__ASSERT(from != nullptr);
-      R__ASSERT(to != nullptr);
-      auto cxLevel = compression % 100;
-      if (cxLevel == 0) {
-         memcpy(to, from, nbytes);
-         return nbytes;
-      }
-
-      auto cxAlgorithm = static_cast<ROOT::RCompressionSetting::EAlgorithm::EValues>(compression / 100);
-      unsigned int nZipBlocks = 1 + (nbytes - 1) / kMAXZIPBUF;
-      const char *source = static_cast<const char *>(from);
-      int szTarget = nbytes;
-      char *target = reinterpret_cast<char *>(to);
-      int szOutBlock = 0;
-      int szRemaining = nbytes;
-      size_t szZipData = 0;
-      for (unsigned int i = 0; i < nZipBlocks; ++i) {
-         int szSource = std::min(static_cast<int>(kMAXZIPBUF), szRemaining);
-         R__zipMultipleAlgorithm(cxLevel, &szSource, source, &szTarget, target, &szOutBlock, cxAlgorithm);
-         R__ASSERT(szOutBlock >= 0);
-         if ((szOutBlock == 0) || (szOutBlock >= szSource)) {
-            // Uncompressible block, we have to store the entire input data stream uncompressed
-            memcpy(to, from, nbytes);
-            return nbytes;
-         }
-
-         szZipData += szOutBlock;
-         source += szSource;
-         target += szOutBlock;
-         szRemaining -= szSource;
-      }
-      R__ASSERT(szRemaining == 0);
-      R__ASSERT(szZipData < nbytes);
-      return szZipData;
-   }
-};
-
-// clang-format off
-/**
 \class ROOT::Internal::RNTupleDecompressor
 \ingroup NTuple
 \brief Helper class to uncompress data blocks in the ROOT compression frame format
@@ -144,6 +89,88 @@ public:
          throw ROOT::RException(R__FAIL(std::string("unexpected trailing bytes in zip buffer")));
       }
    }
+};
+
+inline void VerifyZipRoundtrip(const void *from, std::size_t nbytes, const void *to, std::size_t szZipData)
+{
+   if (nbytes == szZipData) {
+      if (std::memcmp(from, to, nbytes) != 0)
+         throw ROOT::RException(R__FAIL("zip verify: uncompressed page buffer mismatch"));
+      return;
+   }
+
+   const auto roundtrip = std::make_unique<char[]>(nbytes);
+   RNTupleDecompressor::Unzip(to, szZipData, nbytes, roundtrip.get());
+   if (std::memcmp(from, roundtrip.get(), nbytes) != 0)
+      throw ROOT::RException(R__FAIL("zip verify: decompressed page buffer mismatch"));
+}
+
+// clang-format off
+/**
+\class ROOT::Internal::RNTupleCompressor
+\ingroup NTuple
+\brief Helper class to compress data blocks in the ROOT compression frame format
+*/
+// clang-format on
+class RNTupleCompressor {
+public:
+   RNTupleCompressor() = delete;
+   RNTupleCompressor(const RNTupleCompressor &other) = delete;
+   RNTupleCompressor &operator=(const RNTupleCompressor &other) = delete;
+   RNTupleCompressor(RNTupleCompressor &&other) = delete;
+   RNTupleCompressor &operator=(RNTupleCompressor &&other) = delete;
+
+   /// When enabled, every Zip() round-trips through Unzip() and compares page bytes.
+   static void SetVerifyRoundtrip(bool enable) { fVerifyRoundtrip = enable; }
+   static bool GetVerifyRoundtrip() { return fVerifyRoundtrip; }
+
+   /// Returns the size of the compressed data, written into the provided output buffer.
+   static std::size_t Zip(const void *from, std::size_t nbytes, int compression, void *to)
+   {
+      R__ASSERT(from != nullptr);
+      R__ASSERT(to != nullptr);
+      auto cxLevel = compression % 100;
+      if (cxLevel == 0) {
+         memcpy(to, from, nbytes);
+         if (fVerifyRoundtrip)
+            VerifyZipRoundtrip(from, nbytes, to, nbytes);
+         return nbytes;
+      }
+
+      auto cxAlgorithm = static_cast<ROOT::RCompressionSetting::EAlgorithm::EValues>(compression / 100);
+      unsigned int nZipBlocks = 1 + (nbytes - 1) / kMAXZIPBUF;
+      const char *source = static_cast<const char *>(from);
+      int szTarget = nbytes;
+      char *target = reinterpret_cast<char *>(to);
+      int szOutBlock = 0;
+      int szRemaining = nbytes;
+      size_t szZipData = 0;
+      for (unsigned int i = 0; i < nZipBlocks; ++i) {
+         int szSource = std::min(static_cast<int>(kMAXZIPBUF), szRemaining);
+         R__zipMultipleAlgorithm(cxLevel, &szSource, source, &szTarget, target, &szOutBlock, cxAlgorithm);
+         R__ASSERT(szOutBlock >= 0);
+         if ((szOutBlock == 0) || (szOutBlock >= szSource)) {
+            // Uncompressible block, we have to store the entire input data stream uncompressed
+            memcpy(to, from, nbytes);
+            if (fVerifyRoundtrip)
+               VerifyZipRoundtrip(from, nbytes, to, nbytes);
+            return nbytes;
+         }
+
+         szZipData += szOutBlock;
+         source += szSource;
+         target += szOutBlock;
+         szRemaining -= szSource;
+      }
+      R__ASSERT(szRemaining == 0);
+      R__ASSERT(szZipData < nbytes);
+      if (fVerifyRoundtrip)
+         VerifyZipRoundtrip(from, nbytes, to, szZipData);
+      return szZipData;
+   }
+
+private:
+   inline static bool fVerifyRoundtrip = false;
 };
 
 } // namespace Internal

@@ -4,6 +4,7 @@
 #include <ROOT/RConfig.hxx>
 #include <ROOT/RNTupleImporter.hxx>
 #include <ROOT/RNTupleWriteOptions.hxx>
+#include <ROOT/RNTupleZip.hxx>
 
 #include <Compression.h>
 #include <TFile.h>
@@ -56,6 +57,9 @@ Options:
   --jobs N                 Run up to N variants in parallel (default: 1). Use 0 for auto
                            (number of CPU threads, capped by variant count). Requires fork().
   --quiet                  Suppress per-variant progress (used for parallel workers).
+  --no-out                 Run conversions without keeping output files; print summary only.
+  --verify                 After each page is compressed, decompress it and compare with the
+                           raw input buffer (catches codec round-trip corruption).
   --only-variant LABEL     Run only the given format (see labels below).
   --worker-result PATH     Internal: write one-line key/value result metrics to PATH.
   -h, --help               Show this help.
@@ -83,6 +87,8 @@ If outputBase is omitted, it defaults to "<input-stem>_ntuple".
 
 struct RunOptions {
    bool fKeepColumnEncoding = false;
+   bool fNoOut = false;
+   bool fVerify = false;
    bool fQuiet = false;
    int fJobs = 1;
    std::optional<std::size_t> fPageSize;
@@ -103,11 +109,18 @@ struct FilterStatsSummary {
    double fNoTransformPct = 0.0;
 };
 
+struct AutoCodecStatsSummary {
+   bool fValid = false;
+   std::uint64_t fSelections = 0;
+   std::uint64_t fCodecHits[6] = {};
+};
+
 struct VariantResult {
    std::string fLabel;
    std::uint64_t fOutputBytes = 0;
    double fElapsedSec = 0.0;
    FilterStatsSummary fFilters;
+   AutoCodecStatsSummary fAutoCodec;
 };
 
 std::string BasenameNoExt(std::string path)
@@ -130,6 +143,23 @@ void RemoveIfExists(const std::string &path)
 {
    if (!gSystem->AccessPathName(path.c_str()))
       gSystem->Unlink(path.c_str());
+}
+
+std::string MakeTempRootPath()
+{
+   TString tmp;
+   FILE *f = gSystem->TempFileName(tmp, nullptr, ".root");
+   if (!f)
+      throw std::runtime_error("failed to create temporary output file");
+   std::fclose(f);
+   return tmp.Data();
+}
+
+std::string ResolveVariantOutputPath(const RunOptions &opts, const std::string &suffix)
+{
+   if (opts.fNoOut)
+      return MakeTempRootPath();
+   return JoinPath(opts.fOutputBase, suffix);
 }
 
 std::optional<std::uint64_t> FileSizeBytes(const std::string &path)
@@ -222,6 +252,13 @@ void WriteWorkerResult(const std::string &path, const VariantResult &result)
    out << "filter_off_pct=" << result.fFilters.fFilterOffPct << '\n';
    out << "raw_won_pct=" << result.fFilters.fRawWonPct << '\n';
    out << "no_transform_pct=" << result.fFilters.fNoTransformPct << '\n';
+   out << "auto_valid=" << (result.fAutoCodec.fValid ? 1 : 0) << '\n';
+   out << "auto_selections=" << result.fAutoCodec.fSelections << '\n';
+   out << "auto_zstd=" << result.fAutoCodec.fCodecHits[kLHC4CodecZstd] << '\n';
+   out << "auto_lz=" << result.fAutoCodec.fCodecHits[kLHC4CodecLz] << '\n';
+   out << "auto_bwt=" << result.fAutoCodec.fCodecHits[kLHC4CodecBwt] << '\n';
+   out << "auto_lzma=" << result.fAutoCodec.fCodecHits[kLHC4CodecLzma] << '\n';
+   out << "auto_bzip3=" << result.fAutoCodec.fCodecHits[kLHC4CodecBzip3] << '\n';
 }
 
 VariantResult ReadWorkerResult(const std::string &path)
@@ -254,6 +291,20 @@ VariantResult ReadWorkerResult(const std::string &path)
          result.fFilters.fRawWonPct = std::stod(value);
       else if (key == "no_transform_pct")
          result.fFilters.fNoTransformPct = std::stod(value);
+      else if (key == "auto_valid")
+         result.fAutoCodec.fValid = ParseBoolValue(value);
+      else if (key == "auto_selections")
+         result.fAutoCodec.fSelections = std::stoull(value);
+      else if (key == "auto_zstd")
+         result.fAutoCodec.fCodecHits[kLHC4CodecZstd] = std::stoull(value);
+      else if (key == "auto_lz")
+         result.fAutoCodec.fCodecHits[kLHC4CodecLz] = std::stoull(value);
+      else if (key == "auto_bwt")
+         result.fAutoCodec.fCodecHits[kLHC4CodecBwt] = std::stoull(value);
+      else if (key == "auto_lzma")
+         result.fAutoCodec.fCodecHits[kLHC4CodecLzma] = std::stoull(value);
+      else if (key == "auto_bzip3")
+         result.fAutoCodec.fCodecHits[kLHC4CodecBzip3] = std::stoull(value);
    }
    return result;
 }
@@ -316,6 +367,14 @@ RunOptions ParseArgs(int argc, char **argv)
       }
       if (arg == "--quiet") {
          opts.fQuiet = true;
+         continue;
+      }
+      if (arg == "--no-out") {
+         opts.fNoOut = true;
+         continue;
+      }
+      if (arg == "--verify") {
+         opts.fVerify = true;
          continue;
       }
       if (arg == "--jobs") {
@@ -439,6 +498,25 @@ void AppendAutoMinGainArgs(std::vector<std::string> &args, const RunOptions &opt
    }
 }
 
+void AppendNoOutArgs(std::vector<std::string> &args, const RunOptions &opts)
+{
+   if (opts.fNoOut)
+      args.emplace_back("--no-out");
+}
+
+void AppendVerifyArgs(std::vector<std::string> &args, const RunOptions &opts)
+{
+   if (opts.fVerify)
+      args.emplace_back("--verify");
+}
+
+struct ZipVerifyGuard {
+   explicit ZipVerifyGuard(bool enable) { ROOT::Internal::RNTupleCompressor::SetVerifyRoundtrip(enable); }
+   ~ZipVerifyGuard() { ROOT::Internal::RNTupleCompressor::SetVerifyRoundtrip(false); }
+   ZipVerifyGuard(const ZipVerifyGuard &) = delete;
+   ZipVerifyGuard &operator=(const ZipVerifyGuard &) = delete;
+};
+
 #ifdef R__HAS_LHC4CODEC
 void ResetLHC4Globals(int autoMinGainPct)
 {
@@ -481,6 +559,20 @@ FilterStatsSummary ReadFilterStatsSummary()
    out.fFilterOffPct = 100.0 * static_cast<double>(filterOff) / denom;
    out.fRawWonPct = 100.0 * static_cast<double>(stats.raw_won_pages) / denom;
    out.fNoTransformPct = 100.0 * static_cast<double>(stats.no_transform_pages) / denom;
+   return out;
+}
+
+AutoCodecStatsSummary ReadAutoCodecStatsSummary()
+{
+   R__LHC4AutoCodecStatsSummary stats{};
+   R__GetLHC4AutoCodecStatsSummary(&stats);
+   AutoCodecStatsSummary out;
+   if (stats.auto_selections == 0)
+      return out;
+   out.fValid = true;
+   out.fSelections = stats.auto_selections;
+   for (int i = 0; i < 6; ++i)
+      out.fCodecHits[i] = stats.codec_hits[i];
    return out;
 }
 #endif
@@ -543,7 +635,7 @@ const Variant *FindVariant(const std::vector<Variant> &variants, const std::stri
 
 std::optional<VariantResult> ImportVariant(const std::string &inputFile, const std::string &treeName,
                                            const std::string &outputFile, const Variant &variant, bool quiet,
-                                           int autoMinGainPct)
+                                           int autoMinGainPct, bool discardOutput, bool verify)
 {
 #ifdef R__HAS_LHC4CODEC
    if (variant.fUsesLHC4Globals) {
@@ -565,8 +657,12 @@ std::optional<VariantResult> ImportVariant(const std::string &inputFile, const s
 #endif
 
    RemoveIfExists(outputFile);
-   if (!quiet)
-      std::cout << "Writing " << variant.fLabel << " -> " << outputFile << std::endl;
+   if (!quiet) {
+      if (discardOutput)
+         std::cout << "Converting " << variant.fLabel << " (--no-out)" << std::endl;
+      else
+         std::cout << "Writing " << variant.fLabel << " -> " << outputFile << std::endl;
+   }
 
 #ifdef R__HAS_LHC4CODEC
    if (variant.fUsesLHC4Globals)
@@ -575,6 +671,7 @@ std::optional<VariantResult> ImportVariant(const std::string &inputFile, const s
 
    const auto t0 = std::chrono::steady_clock::now();
 
+   ZipVerifyGuard verifyGuard(verify);
    auto importer = RNTupleImporter::Create(inputFile, treeName, outputFile);
    importer->SetWriteOptions(variant.fOptions);
    if (quiet)
@@ -607,7 +704,11 @@ std::optional<VariantResult> ImportVariant(const std::string &inputFile, const s
 #ifdef R__HAS_LHC4CODEC
    if (variant.fUsesLHC4Globals)
       result.fFilters = ReadFilterStatsSummary();
+   if (std::strcmp(variant.fLabel, "lhc4_auto") == 0)
+      result.fAutoCodec = ReadAutoCodecStatsSummary();
 #endif
+   if (discardOutput)
+      RemoveIfExists(outputFile);
    return result;
 }
 
@@ -632,13 +733,41 @@ std::uint64_t FindNativeZstdOutputBytes(const std::vector<VariantResult> &result
    return 0;
 }
 
+void PrintAutoCodecSummary(const AutoCodecStatsSummary &stats)
+{
+   if (!stats.fValid)
+      return;
+
+   std::cout << "\nlhc4_auto backend mix (" << stats.fSelections << " page"
+             << (stats.fSelections == 1 ? "" : "s") << "):\n";
+
+   struct Row {
+      const char *fName;
+      int fCodec;
+   };
+   static constexpr Row kOrder[] = {{"zstd", kLHC4CodecZstd},   {"lz", kLHC4CodecLz},     {"bwt", kLHC4CodecBwt},
+                                    {"lzma", kLHC4CodecLzma}, {"bzip3", kLHC4CodecBzip3}};
+
+   for (const auto &row : kOrder) {
+      const auto n = stats.fCodecHits[row.fCodec];
+      if (n == 0)
+         continue;
+      const double pct = 100.0 * static_cast<double>(n) / static_cast<double>(stats.fSelections);
+      std::cout << "  " << std::left << std::setw(6) << row.fName << std::right << std::setw(8) << n << " ("
+                << std::fixed << std::setprecision(1) << pct << "%)\n";
+   }
+}
+
 void PrintSummaryTable(const RunOptions &opts, std::uint64_t inputBytes,
                        const std::vector<VariantResult> &results)
 {
    std::cout << "\n=== tree2ntuple summary ===\n";
    std::cout << "Input:  " << opts.fInputFile << " [" << opts.fTreeName << "]\n";
    std::cout << "Input size: " << FormatBytes(inputBytes) << '\n';
-   std::cout << "Output base: " << opts.fOutputBase << '\n';
+   if (opts.fNoOut)
+      std::cout << "Output: (none, --no-out)\n";
+   else
+      std::cout << "Output base: " << opts.fOutputBase << '\n';
    std::cout << "Page size: " << FormatPageSizeSettings(opts) << '\n';
    std::cout << "Auto min gain: " << ResolveAutoMinGainPct(opts) << "%\n";
    std::cout << '\n';
@@ -673,14 +802,19 @@ void PrintSummaryTable(const RunOptions &opts, std::uint64_t inputBytes,
    std::cout << "Gain  = space saved vs native_zstd output (positive = smaller file, native_zstd is 0%).\n";
    std::cout << "Filter on  = lhc4codec byte transform kept on wire (filtered won).\n";
    std::cout << "Filter off = raw won + no transform + stored fallback + plain pages.\n";
+
+   for (const auto &row : results) {
+      if (row.fLabel == "lhc4_auto")
+         PrintAutoCodecSummary(row.fAutoCodec);
+   }
 }
 
 std::vector<VariantResult> RunSequential(const RunOptions &opts)
 {
    std::vector<VariantResult> results;
    for (const auto &variant : MakeVariants(opts)) {
-      if (auto row = ImportVariant(opts.fInputFile, opts.fTreeName, JoinPath(opts.fOutputBase, variant.fSuffix),
-                                   variant, opts.fQuiet, ResolveAutoMinGainPct(opts))) {
+      if (auto row = ImportVariant(opts.fInputFile, opts.fTreeName, ResolveVariantOutputPath(opts, variant.fSuffix),
+                                   variant, opts.fQuiet, ResolveAutoMinGainPct(opts), opts.fNoOut, opts.fVerify)) {
          results.push_back(*row);
       }
    }
@@ -702,6 +836,8 @@ std::vector<std::string> BuildWorkerArgv(const char *executable, const RunOption
       args.emplace_back("--keep-column-encoding");
    AppendPageSizeArgs(args, opts);
    AppendAutoMinGainArgs(args, opts);
+   AppendNoOutArgs(args, opts);
+   AppendVerifyArgs(args, opts);
    args.push_back(opts.fInputFile);
    args.push_back(opts.fTreeName);
    args.push_back(opts.fOutputBase);
@@ -837,8 +973,8 @@ int RunWorkerMode(const RunOptions &opts)
    ROOT::EnableImplicitMT();
 
    const bool quiet = !opts.fWorkerResult.empty();
-   auto result = ImportVariant(opts.fInputFile, opts.fTreeName, JoinPath(opts.fOutputBase, variant->fSuffix), *variant,
-                               quiet, ResolveAutoMinGainPct(opts));
+   auto result = ImportVariant(opts.fInputFile, opts.fTreeName, ResolveVariantOutputPath(opts, variant->fSuffix),
+                               *variant, quiet, ResolveAutoMinGainPct(opts), opts.fNoOut, opts.fVerify);
    if (!result)
       return 1;
 
@@ -868,6 +1004,8 @@ int RunMain(const RunOptions &opts, const char *executable)
       std::cout << "Page size: " << FormatPageSizeSettings(opts) << '\n';
    if (!opts.fQuiet)
       std::cout << "Auto min gain: " << ResolveAutoMinGainPct(opts) << "%\n";
+   if (opts.fVerify && !opts.fQuiet)
+      std::cout << "Verify: enabled (compress/decompress round-trip per page)\n";
 
    std::vector<VariantResult> results;
 #if defined(_WIN32)

@@ -73,6 +73,13 @@ struct R__LHC4CompressStatsSummary {
 };
 void R__GetLHC4CompressStatsSummary(struct R__LHC4CompressStatsSummary *out);
 
+/// Auto-mode winner histogram (indexed by kLHC4Codec*; only populated for lhc4_auto runs).
+struct R__LHC4AutoCodecStatsSummary {
+   unsigned long long auto_selections;
+   unsigned long long codec_hits[6];
+};
+void R__GetLHC4AutoCodecStatsSummary(struct R__LHC4AutoCodecStatsSummary *out);
+
 #ifdef __cplusplus
 }
 #endif

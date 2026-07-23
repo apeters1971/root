@@ -229,3 +229,13 @@ extern "C" void R__GetLHC4CompressStatsSummary(R__LHC4CompressStatsSummary *out)
    out->stored_fallback_pages = stats.stored_fallback_pages;
    out->plain_pages = stats.plain_pages;
 }
+
+extern "C" void R__GetLHC4AutoCodecStatsSummary(R__LHC4AutoCodecStatsSummary *out)
+{
+   if (!out)
+      return;
+   const auto stats = lhc4codec::get_compress_stats();
+   out->auto_selections = stats.auto_selections;
+   for (int i = 0; i < 6; ++i)
+      out->codec_hits[i] = stats.auto_codec_hits[i];
+}
