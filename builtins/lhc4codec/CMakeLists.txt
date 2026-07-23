@@ -14,10 +14,10 @@
 include(ExternalProject)
 
 # **PLEASE UPDATE ALSO THE FOLLOWING LINE WHEN UPDATING THE VERSION**
-# 20 Jul 2026, https://gitlab.cern.ch/eos/lhc4codec.git @ e3a8d03
+# 23 Jul 2026, https://gitlab.cern.ch/eos/lhc4codec.git @ 7b800ce
 set(ROOT_LHC4CODEC_VERSION 2.2.0)
 set(ROOT_LHC4CODEC_GIT_REPOSITORY "https://gitlab.cern.ch/eos/lhc4codec.git")
-set(ROOT_LHC4CODEC_GIT_TAG "e3a8d0323400183baa267f2782a030bd82724757")
+set(ROOT_LHC4CODEC_GIT_TAG "7b800cec2f817c2ad3e5d33128536a298aaea2e4")
 
 set(_lhc4codec_build_args
   -DLHC4CODEC_BUILD_CLI=OFF
