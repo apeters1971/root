@@ -137,6 +137,8 @@ Convert a TTree into RNTuple files:
                                  filters, same kind of compressor as Beam)
   <outputBase>_spectra8_crystal_profileN.root spectra8 Crystal with pretrained per-column
                                  profiles (Real32=float, Index32/UInt32=poisson, Char=text)
+  <outputBase>_spectra8_crystal_learnedN.root spectra8 Crystal with learned column
+                                 profiles stored once in metadata (header/footer)
   <outputBase>_spectra8_oracleN.root spectra8 filters + Oracle (not raced by Auto)
   <outputBase>_spectra8_flashN.root  spectra8 filters + Flash (byte-aligned LZ without an
                                  entropy stage, fastest decoder; not raced by Auto)
@@ -602,7 +604,8 @@ int TrailingVariantLevel(const std::string &label)
 
 bool IsDedicatedLevelVariant(const std::string &label)
 {
-   return label == "spectra8_crystal7" || label == "spectra8_crystal9";
+   return label == "spectra8_crystal7" || label == "spectra8_crystal9" || label == "spectra8_crystal_learned7" ||
+          label == "spectra8_crystal_learned9";
 }
 
 std::string TrimCopy(const std::string &text)
@@ -1085,6 +1088,7 @@ struct Variant {
    int fSpectra8Codec = 0;
    bool fRequireCodecAvailable = false;
    bool fSpectra8ProfilePerColumn = false;
+   bool fLearnedProfiles = false;
 };
 
 const Variant *FindVariant(const std::vector<Variant> &variants, const std::string &label);
@@ -1122,14 +1126,26 @@ std::vector<Variant> MakeVariants(const RunOptions &runOpts)
    variants.push_back({"spectra8_crystal5", "_spectra8_crystal" + lv, spectra8Opts, true, true, kSpectra8CodecCrystal, false});
    variants.push_back({"spectra8_crystal_profile5", "_spectra8_crystal_profile" + lv, spectra8Opts, true, true, kSpectra8CodecCrystal,
                        false, true});
+   auto learnedOpts5 = spectra8Opts;
+   learnedOpts5.SetEnableLearnedProfiles(true);
+   variants.push_back({"spectra8_crystal_learned5", "_spectra8_crystal_learned" + lv, learnedOpts5, true, true,
+                       kSpectra8CodecCrystal, false, true, true});
 
    // Extra Crystal 7/9 comparison variants only at the default level so suffixes do not collide.
    if (kLevel == kDefaultSpectra8Level) {
       const auto spectra8Opts7 = MakeSpectra8WriteOptions(7, runOpts.fKeepColumnEncoding);
       variants.push_back({"spectra8_crystal7", "_spectra8_crystal7", spectra8Opts7, true, true, kSpectra8CodecCrystal, false});
+      auto learnedOpts7 = spectra8Opts7;
+      learnedOpts7.SetEnableLearnedProfiles(true);
+      variants.push_back({"spectra8_crystal_learned7", "_spectra8_crystal_learned7", learnedOpts7, true, true, kSpectra8CodecCrystal,
+                          false, true, true});
 
       const auto spectra8Opts9 = MakeSpectra8WriteOptions(9, runOpts.fKeepColumnEncoding);
       variants.push_back({"spectra8_crystal9", "_spectra8_crystal9", spectra8Opts9, true, true, kSpectra8CodecCrystal, false});
+      auto learnedOpts9 = spectra8Opts9;
+      learnedOpts9.SetEnableLearnedProfiles(true);
+      variants.push_back({"spectra8_crystal_learned9", "_spectra8_crystal_learned9", learnedOpts9, true, true, kSpectra8CodecCrystal,
+                          false, true, true});
    }
 
    variants.push_back({"spectra8_oracle5", "_spectra8_oracle" + lv, spectra8Opts, true, true, kSpectra8CodecOracle, false});
@@ -1209,8 +1225,9 @@ std::optional<VariantResult> ImportVariant(const std::string &inputFile, const s
             std::cerr << "Skipping " << variant.fLabel << ": spectra8 backend is not available in this build\n";
          return std::nullopt;
       }
+      int effectiveProfile = variant.fLearnedProfiles ? kSpectra8ProfileNone : profile;
       ConfigureSpectra8FilterGlobals(variant.fSpectra8Codec, variant.fEnableSpectra8ByteFilters, autoMinGainPct, autoMaxLevel,
-                                 autoCodecs, profile, profileId, variant.fSpectra8ProfilePerColumn);
+                                autoCodecs, effectiveProfile, profileId, variant.fSpectra8ProfilePerColumn);
    } else {
       ResetSpectra8Globals(autoMinGainPct, autoMaxLevel, autoCodecs);
    }
@@ -1258,6 +1275,19 @@ std::optional<VariantResult> ImportVariant(const std::string &inputFile, const s
 
    if (!quiet)
       std::cout << "  done\n";
+#ifdef R__HAS_SPECTRA8
+   if (!quiet && variant.fUsesSpectra8Globals) {
+      R__Spectra8CompressStatsSummary stats{};
+      R__GetSpectra8CompressStatsSummary(&stats);
+      if (const auto total = stats.crystal_profile_blocks + stats.crystal_profile_escapes; total > 0) {
+         std::cout << "  Crystal profile blocks: " << stats.crystal_profile_blocks << " coded with profile, "
+                   << stats.crystal_profile_escapes << " escaped to dynamic ("
+                   << FormatPct(100.0 * static_cast<double>(stats.crystal_profile_escapes) /
+                                static_cast<double>(total))
+                   << ")\n";
+      }
+   }
+#endif
 
    VariantResult result;
    result.fLabel = variant.fLabel;

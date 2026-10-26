@@ -156,6 +156,8 @@ Re-encode an RNTuple with different page compressors:
                                  filters, same kind of compressor as Beam)
   <outputBase>_spectra8_crystal_profileN.root spectra8 Crystal with pretrained per-column
                                  profiles (Real32=float, Index32/UInt32=poisson, Char=text)
+  <outputBase>_spectra8_crystal_learnedN.root spectra8 Crystal with learned column
+                                 profiles stored once in metadata (header/footer)
   <outputBase>_spectra8_oracleN.root spectra8 filters + Oracle (not raced by Auto)
   <outputBase>_spectra8_flashN.root  spectra8 filters + Flash (byte-aligned LZ without an
                                  entropy stage, fastest decoder; not raced by Auto)
@@ -1085,6 +1087,7 @@ struct Variant {
    int fSpectra8Codec = 0;
    bool fRequireCodecAvailable = false;
    bool fSpectra8ProfilePerColumn = false;
+   bool fLearnedProfiles = false;
 };
 
 RNTupleWriteOptions MakeNativeWriteOptions(ROOT::RCompressionSetting::EAlgorithm::EValues algorithm, int level)
@@ -1120,6 +1123,10 @@ std::vector<Variant> MakeVariants(const RunOptions &runOpts)
    variants.push_back({"spectra8_crystal5", "_spectra8_crystal" + lv, spectra8Opts, true, true, kSpectra8CodecCrystal, false});
    variants.push_back({"spectra8_crystal_profile5", "_spectra8_crystal_profile" + lv, spectra8Opts, true, true, kSpectra8CodecCrystal,
                        false, true});
+   auto learnedOpts = spectra8Opts;
+   learnedOpts.SetEnableLearnedProfiles(true);
+   variants.push_back({"spectra8_crystal_learned5", "_spectra8_crystal_learned" + lv, learnedOpts, true, true,
+                       kSpectra8CodecCrystal, false, true, true});
    variants.push_back({"spectra8_oracle5", "_spectra8_oracle" + lv, spectra8Opts, true, true, kSpectra8CodecOracle, false});
    variants.push_back({"spectra8_flash5", "_spectra8_flash" + lv, spectra8Opts, true, true, kSpectra8CodecFlash, false});
    variants.push_back({"spectra8_laser5", "_spectra8_laser" + lv, spectra8Opts, true, true, kSpectra8CodecLaser, false});
@@ -1319,8 +1326,9 @@ std::optional<VariantResult> ReencodeVariant(const std::string &inputFile, const
             std::cerr << "Skipping " << variant.fLabel << ": spectra8 backend is not available in this build\n";
          return std::nullopt;
       }
+      int effectiveProfile = variant.fLearnedProfiles ? kSpectra8ProfileNone : profile;
       ConfigureSpectra8FilterGlobals(variant.fSpectra8Codec, variant.fEnableSpectra8ByteFilters, autoMinGainPct, autoMaxLevel,
-                                 autoCodecs, profile, profileId, variant.fSpectra8ProfilePerColumn);
+                                autoCodecs, effectiveProfile, profileId, variant.fSpectra8ProfilePerColumn);
    } else {
       ResetSpectra8Globals(autoMinGainPct, autoMaxLevel, autoCodecs);
    }

@@ -142,6 +142,24 @@ unsigned R__GetSpectra8ProfileId(void);
 /// Train a custom static profile from columnar sample bytes and register it.
 /// `profileId` must be >= 5. `stride` is the element width in bytes. Returns 1 on success.
 int R__Spectra8TrainAndRegisterProfile(unsigned profileId, const void *sample, size_t sampleSize, int stride);
+int R__Spectra8TrainAndRegisterProfileLevel(unsigned profileId, const void *sample, size_t sampleSize, int stride, int level);
+
+/// Train a static Crystal profile model from sample columnar data.
+/// If outModel is NULL, writes required size to *outModelSize and returns 1.
+/// Returns 1 on success, 0 on failure.
+int R__Spectra8TrainProfileModel(const void *sample, size_t sampleSize, int stride,
+                             void *outModel, size_t *outModelSize);
+int R__Spectra8TrainProfileModelLevel(const void *sample, size_t sampleSize, int stride, int level,
+                                  void *outModel, size_t *outModelSize);
+
+/// Register a serialized profile model under profileId (>= 5).
+/// Returns 1 on success, 0 on failure.
+int R__Spectra8RegisterProfileModel(unsigned profileId, const void *modelBytes, size_t modelSize);
+
+/// Export an already-registered or builtin profile model to serialized bytes.
+/// If outModel is NULL, writes required size to *outModelSize and returns 1.
+/// Returns 1 on success, 0 on failure.
+int R__Spectra8ExportProfileModel(unsigned profileId, void *outModel, size_t *outModelSize);
 
 /// Legacy convenience: enable BWT block mode. Disabling it returns to Crystal.
 void R__SetSpectra8Bwt(int enable);
@@ -162,6 +180,9 @@ struct R__Spectra8CompressStatsSummary {
    unsigned long long no_transform_pages;
    unsigned long long stored_fallback_pages;
    unsigned long long plain_pages;
+   /// Crystal blocks requested with a static profile: coded with it / escaped to a dynamic block
+   unsigned long long crystal_profile_blocks;
+   unsigned long long crystal_profile_escapes;
 };
 void R__GetSpectra8CompressStatsSummary(struct R__Spectra8CompressStatsSummary *out);
 

@@ -11,6 +11,7 @@
 #include "ZipSpectra8.h"
 
 #include "spectra8/spectra8.hpp"
+#include "spectra8/spectra8_c.h"
 
 #include <atomic>
 #include <cstddef>
@@ -360,12 +361,39 @@ static int EffectiveSpectra8Profile()
 
 extern "C" int R__Spectra8TrainAndRegisterProfile(unsigned profileId, const void *sample, size_t sampleSize, int stride)
 {
+   return R__Spectra8TrainAndRegisterProfileLevel(profileId, sample, sampleSize, stride, 5);
+}
+
+extern "C" int R__Spectra8TrainAndRegisterProfileLevel(unsigned profileId, const void *sample, size_t sampleSize, int stride, int level)
+{
    if (!sample || sampleSize == 0)
       return 0;
    return spectra8::train_and_register_profile(
-             profileId, std::span<const std::byte>(static_cast<const std::byte *>(sample), sampleSize), stride)
+             profileId, std::span<const std::byte>(static_cast<const std::byte *>(sample), sampleSize), stride, level)
              ? 1
              : 0;
+}
+
+extern "C" int R__Spectra8TrainProfileModel(const void *sample, size_t sampleSize, int stride,
+                                        void *outModel, size_t *outModelSize)
+{
+   return R__Spectra8TrainProfileModelLevel(sample, sampleSize, stride, 5, outModel, outModelSize);
+}
+
+extern "C" int R__Spectra8TrainProfileModelLevel(const void *sample, size_t sampleSize, int stride, int level,
+                                             void *outModel, size_t *outModelSize)
+{
+   return spectra8_train_profile_model_level(sample, sampleSize, stride, level, outModel, outModelSize);
+}
+
+extern "C" int R__Spectra8RegisterProfileModel(unsigned profileId, const void *modelBytes, size_t modelSize)
+{
+   return spectra8_register_profile_model(profileId, modelBytes, modelSize);
+}
+
+extern "C" int R__Spectra8ExportProfileModel(unsigned profileId, void *outModel, size_t *outModelSize)
+{
+   return spectra8_export_profile_model(profileId, outModel, outModelSize);
 }
 
 extern "C" void R__SetSpectra8Bwt(int enable)
@@ -401,8 +429,12 @@ static spectra8::CompressParams MakeSpectra8CompressParams(int cxlevel)
    params.auto_max_level = R__Spectra8AutoMaxLevel != 0;
    params.auto_codecs = R__Spectra8AutoCodecs;
    params.profile = static_cast<spectra8::Profile>(EffectiveSpectra8Profile());
-   // A per-call profile is a builtin id. The process-wide id applies only to the forced profile.
-   params.profile_id = R__Spectra8CallProfile >= 0 ? 0u : R__Spectra8ProfileId;
+   // A per-call profile is a builtin id unless call profile ID is set. The process-wide id applies only to the forced profile.
+   if (R__Spectra8CallProfile >= 0) {
+      params.profile_id = R__Spectra8CallProfileId ? R__Spectra8CallProfileId : static_cast<unsigned>(R__Spectra8CallProfile);
+   } else {
+      params.profile_id = R__Spectra8ProfileId;
+   }
    return params;
 }
 
@@ -546,6 +578,8 @@ extern "C" void R__GetSpectra8CompressStatsSummary(R__Spectra8CompressStatsSumma
    out->no_transform_pages = stats.no_transform_pages;
    out->stored_fallback_pages = stats.stored_fallback_pages;
    out->plain_pages = stats.plain_pages;
+   out->crystal_profile_blocks = stats.crystal_profile_blocks;
+   out->crystal_profile_escapes = stats.crystal_profile_escapes;
 }
 
 extern "C" void R__GetSpectra8AutoCodecStatsSummary(R__Spectra8AutoCodecStatsSummary *out)
