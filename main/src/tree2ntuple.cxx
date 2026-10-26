@@ -1,16 +1,10 @@
 /// \file tree2ntuple.cxx
-/// \brief Convert a TTree into RNTuple files using ROOT's native page compressors.
+/// \brief Convert a TTree into several RNTuple output files for compression studies.
 
-/*************************************************************************
- * Copyright (C) 1995-2026, Rene Brun and Fons Rademakers.               *
- * All rights reserved.                                                  *
- *                                                                       *
- * For the licensing terms see $ROOTSYS/LICENSE.                         *
- * For the list of contributors see $ROOTSYS/README/CREDITS.             *
- *************************************************************************/
-
+#include <ROOT/RConfig.hxx>
 #include <ROOT/RNTupleImporter.hxx>
 #include <ROOT/RNTupleWriteOptions.hxx>
+#include <ROOT/RNTupleZip.hxx>
 
 #include "RNTupleBench.hxx"
 
@@ -18,11 +12,47 @@
 #include <TFile.h>
 #include <TKey.h>
 #include <TROOT.h>
-#include <TString.h>
 #include <TSystem.h>
 #include <TTree.h>
 
+#ifdef R__HAS_SPECTRA8
+#include <ZipSpectra8.h>
+#else
+// Worker-result keys compile even when ROOT was built without spectra8.
+enum {
+   kSpectra8CodecBeam = 0,
+   kSpectra8CodecLz = 0,
+   kSpectra8CodecBwt = 1,
+   kSpectra8CodecZstd = 2,
+   kSpectra8CodecBzip3 = 3,
+   kSpectra8CodecLzma = 4,
+   kSpectra8CodecAuto = 5,
+   kSpectra8CodecMosaic = 6,
+   kSpectra8CodecOracle = 7,
+   kSpectra8CodecCrystal = 8,
+   kSpectra8CodecFlash = 9,
+   kSpectra8CodecLaser = 10,
+   kSpectra8CodecGrating = 11,
+   kSpectra8CodecCount = 12,
+};
+#define kSpectra8CodecBit(c) (1u << (unsigned)(c))
+#define kSpectra8AutoCodecsRoot \
+   (kSpectra8CodecBit(kSpectra8CodecZstd) | kSpectra8CodecBit(kSpectra8CodecBeam) | kSpectra8CodecBit(kSpectra8CodecCrystal))
+#define kSpectra8AutoCodecsAll                                                                 \
+   (kSpectra8AutoCodecsRoot | kSpectra8CodecBit(kSpectra8CodecMosaic) | kSpectra8CodecBit(kSpectra8CodecBwt) | \
+    kSpectra8CodecBit(kSpectra8CodecLaser) | kSpectra8CodecBit(kSpectra8CodecLzma) | kSpectra8CodecBit(kSpectra8CodecBzip3))
+enum {
+   kSpectra8ProfileNone = 0,
+   kSpectra8ProfileFloatKinematics = 1,
+   kSpectra8ProfilePoissonCounts = 2,
+   kSpectra8ProfileIntMonotonic = 3,
+   kSpectra8ProfileText = 4,
+   kSpectra8ProfileCustom = 5,
+};
+#endif
+
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cerrno>
 #include <cstdio>
@@ -31,14 +61,13 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <utility>
+#include <unordered_set>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -48,80 +77,109 @@
 
 namespace {
 
-using ROOT::RNTupleWriteOptions;
 using ROOT::Experimental::RNTupleImporter;
-using EAlgorithm = ROOT::RCompressionSetting::EAlgorithm;
-using ELevel = ROOT::RCompressionSetting::ELevel;
+using ROOT::RNTupleWriteOptions;
 
-constexpr const char *kUsage = R"USAGE(Usage: tree2ntuple [options] input.root [treeName] [outputBase]
-
-Convert a TTree into one RNTuple file per native ROOT compressor.
+constexpr const char *kUsage = R"(Usage: tree2ntuple [options] input.root [treeName] [outputBase]
 
 Options:
-  --page-size N            Max unzipped page size in bytes (default: 1 MiB).
-  --initial-page-size N    Initial unzipped page size in bytes (default: 256).
-                           Large values need a larger page-buffer budget.
-  --level N                Compression level for every selected variant.
-                           Default levels: zstd 5, lzma 7, zlib 1, lz4 4.
-                           zstd accepts 1..19; the others accept 1..9.
-  --only-variant LIST      Comma-separated variants. A trailing level overrides
-                           --level for that variant (native_lzma9). Families:
-                           native_zstd, native_lzma, native_zlib, native_lz4,
-                           uncompressed.
-  --jobs N                 Up to N variants at once (default: 1). 0 = one job
-                           per CPU, capped by the variant count. Requires fork().
-  --no-out                 Convert, print the summary, and delete the outputs.
-  --quiet                  Suppress per-variant progress.
-  --bench                  After conversion, benchmark page decompression and
-                           LoadEntry on one thread and with implicit MT.
-  --bench-threads N        Threads for the multi-core LoadEntry benchmark
+  --keep-column-encoding   Keep ROOT RNTuple split/delta/zigzag column encodings when using
+                           spectra8 as the page compressor (default: plain columns only).
+  --page-size N            Set max unzipped page size in bytes (RNTupleWriteOptions default: 1 MiB).
+                           Columns start with small pages and grow up to this limit.
+  --initial-page-size N    Advanced: set the initial unzipped page size in bytes (default: 256 B).
+                           Only needed for micro-benchmarks; large values require much more memory.
+  --level N                Compression level for Spectra8 variants (1-11, default 5). Native ZSTD/LZMA
+                           stay at 5/7. Grating has no levels. spectra8_laser9 is the same as
+                           --level 9 --only-variant spectra8_laser5.
+  --auto-min-gain N        Min % size gain for spectra8 Auto to prefer a slower decoder
+                           (default: 1). 0 = always pick the smallest payload.
+  --auto-max-level         For spectra8 Auto, race each codec at its maximum effort
+                           instead of the RNTuple compression level (slower encode).
+  --auto-codecs LIST       Codecs Auto may race: root (default: zstd,beam,crystal),
+                           all, or a comma list (zstd,beam,crystal,mosaic,prism,laser,lzma,bzip3).
+  --profile NAME           On spectra8_crystal_profile5, force one profile on every column:
+                           float, poisson, monotonic, text, or custom.
+                           Default: that variant picks per column. spectra8_crystal5 stays dynamic.
+  --profile-id N           Profile id (0 uses the --profile enum value; custom ids are >= 5).
+  --bench                  Run decompression benchmarks (algorithm + single/multi-core event
+                           reader) on output RNTuple files after conversion.
+  --bench-threads N        Number of threads for multi-core event reader benchmark
                            (default: hardware concurrency).
-  --bench-iters N          Passes for the page-decompression benchmark (default: 5).
-  --bench-entries N        Entries to read (default: 0 = all).
-  --bench-percent N        First N percent of pages and entries (default: 100).
-  --worker-result PATH     Internal: write one variant's metrics to PATH.
+  --bench-iters N          Number of passes for pure page decompression benchmark (default: 5).
+  --bench-entries N        Number of entries to read in event reader benchmark (default: 0 = all).
+  --bench-percent N        Probe the first N percent only (default: 100). Stops the page
+                           unzip after that fraction of compressed bytes, in cluster
+                           order, and LoadEntry after the same fraction of entries.
+                           Example: --bench-percent 5. --bench-entries overrides the
+                           entry count.
+  --jobs N                 Run up to N variants in parallel (default: 1). Use 0 for auto
+                           (number of CPU threads, capped by variant count). Requires fork().
+  --quiet                  Suppress per-variant progress (used for parallel workers).
+  --no-out                 Run conversions without keeping output files; print summary only.
+  --verify                 After each page is compressed, decompress it and compare with the
+                           raw input buffer (catches codec round-trip corruption).
+  --only-variant LABEL     Run only the given format (see labels below).
+  --worker-result PATH     Internal: write one-line key/value result metrics to PATH.
   -h, --help               Show this help.
 
-Default variants (ROOT column encodings kept):
+Convert a TTree into RNTuple files:
 
-  <outputBase>_native_zstd5.root
-  <outputBase>_native_lzma7.root
-  <outputBase>_native_zlib1.root
-  <outputBase>_native_lz4.root
+  <outputBase>_native.root       native RNTuple column encodings + ZSTD (level 5)
+  <outputBase>_native_lzma.root  native RNTuple column encodings + LZMA (level 7)
+  Spectra8 variants use --level (default 5) in the file suffix (spectra8_beam5, spectra8_laser9, ...).
+  <outputBase>_spectra8_zstd.root    spectra8 filters + zstd
+  <outputBase>_spectra8_bzip3.root   spectra8 filters + bzip3
+  <outputBase>_spectra8_beamN.root   spectra8 filters + Beam (spectra8_lz5 is a legacy alias)
+  <outputBase>_spectra8_mosaicN.root spectra8 filters + Mosaic
+  <outputBase>_spectra8_prismN.root  spectra8 filters + Prism
+  <outputBase>_spectra8_crystalN.root spectra8 filters + Crystal (dynamic model and byte
+                                 filters, same kind of compressor as Beam)
+  <outputBase>_spectra8_crystal_profileN.root spectra8 Crystal with pretrained per-column
+                                 profiles (Real32=float, Index32/UInt32=poisson, Char=text)
+  <outputBase>_spectra8_oracleN.root spectra8 filters + Oracle (not raced by Auto)
+  <outputBase>_spectra8_flashN.root  spectra8 filters + Flash (byte-aligned LZ without an
+                                 entropy stage, fastest decoder; not raced by Auto)
+  <outputBase>_spectra8_laserN.root  spectra8 filters + Laser (LZMA2-class range coder
+                                 with a decoupled decoder, raced by --auto-codecs all)
+  <outputBase>_spectra8_grating.root spectra8 filters + Grating (order-0 integer rANS; has no
+                                 levels; not raced by Auto)
+  <outputBase>_spectra8_auto.root    spectra8 filters + Auto codec race (see --auto-min-gain,
+                                 --auto-max-level, --auto-codecs)
+  When --level is left at 5, extra Crystal/learned variants at 7 and 9 are also emitted.
 
-If treeName is omitted, the first TTree in the file is used.
+By default, Spectra8 variants disable ROOT column encodings (plain columns) and enable
+spectra8 byte filters (shuffle/delta/zigzag/dict/RLE as applicable). Use
+--keep-column-encoding to stack ROOT encodings on top of the spectra8 backend.
+
+Parallel mode launches one process per format so spectra8 global settings and
+compression statistics stay isolated.
+
+If treeName is omitted, the first TTree in the input file is used.
 If outputBase is omitted, it defaults to "<input-stem>_ntuple".
-)USAGE";
-
-struct Spec {
-   const char *fFamily;
-   const char *fSuffix;
-   EAlgorithm::EValues fAlgorithm;
-   int fDefaultLevel;
-   bool fCompressed;
-};
-
-constexpr Spec kSpecs[] = {
-   {"native_zstd", "_native_zstd", EAlgorithm::kZSTD, ELevel::kDefaultZSTD, true},
-   {"native_lzma", "_native_lzma", EAlgorithm::kLZMA, ELevel::kDefaultLZMA, true},
-   {"native_zlib", "_native_zlib", EAlgorithm::kZLIB, ELevel::kDefaultZLIB, true},
-   {"native_lz4", "_native_lz4", EAlgorithm::kLZ4, ELevel::kDefaultLZ4, true},
-   {"uncompressed", "_uncompressed", EAlgorithm::kZSTD, 0, false},
-};
+)";
 
 struct RunOptions {
+   bool fKeepColumnEncoding = false;
+   bool fNoOut = false;
+   bool fVerify = false;
+   bool fQuiet = false;
+   int fJobs = 1;
    std::optional<std::size_t> fPageSize;
    std::optional<std::size_t> fInitialPageSize;
-   int fLevel = 0;
+   int fLevel = 5;
    bool fLevelExplicit = false;
+   std::optional<int> fAutoMinGainPct;
+   bool fAutoMaxLevel = false;
+   std::optional<unsigned> fAutoCodecs;
+   int fProfile = kSpectra8ProfileNone;
+   unsigned fProfileId = 0;
    std::string fOnlyVariant;
-   int fJobs = 1;
-   bool fNoOut = false;
-   bool fQuiet = false;
    std::string fWorkerResult;
    std::string fInputFile;
    std::string fTreeName;
    std::string fOutputBase;
+
    bool fBench = false;
    int fBenchThreads = 0;
    int fBenchIters = 5;
@@ -129,23 +187,28 @@ struct RunOptions {
    double fBenchPercent = 100.0;
 };
 
-struct Variant {
-   std::string fFamily;
-   std::string fLabel;
-   std::string fSuffix;
-   int fLevel = 0;
-   RNTupleWriteOptions fOptions;
+struct FilterStatsSummary {
+   bool fValid = false;
+   bool fPageRatioValid = false;
+   double fPageRatio = 0.0;
+   double fFilterOnPct = 0.0;
+   double fFilterOffPct = 0.0;
+   double fRawWonPct = 0.0;
+   double fNoTransformPct = 0.0;
+};
+
+struct AutoCodecStatsSummary {
+   bool fValid = false;
+   std::uint64_t fSelections = 0;
+   std::uint64_t fCodecHits[kSpectra8CodecCount] = {};
 };
 
 struct VariantResult {
    std::string fLabel;
    std::uint64_t fOutputBytes = 0;
    double fElapsedSec = 0.0;
-};
-
-struct Request {
-   const Spec *fSpec = nullptr;
-   std::optional<int> fLevel;
+   FilterStatsSummary fFilters;
+   AutoCodecStatsSummary fAutoCodec;
 };
 
 std::string BasenameNoExt(std::string path)
@@ -159,6 +222,11 @@ std::string BasenameNoExt(std::string path)
    return path;
 }
 
+std::string JoinPath(const std::string &base, const std::string &suffix)
+{
+   return base + suffix + ".root";
+}
+
 void RemoveIfExists(const std::string &path)
 {
    if (!gSystem->AccessPathName(path.c_str()))
@@ -170,16 +238,16 @@ std::string MakeTempRootPath()
    TString tmp;
    FILE *f = gSystem->TempFileName(tmp, nullptr, ".root");
    if (!f)
-      throw std::runtime_error("failed to create a temporary output file");
+      throw std::runtime_error("failed to create temporary output file");
    std::fclose(f);
-   return std::string(tmp.Data());
+   return tmp.Data();
 }
 
 std::string ResolveVariantOutputPath(const RunOptions &opts, const std::string &suffix)
 {
    if (opts.fNoOut)
       return MakeTempRootPath();
-   return opts.fOutputBase + suffix + ".root";
+   return JoinPath(opts.fOutputBase, suffix);
 }
 
 std::optional<std::uint64_t> FileSizeBytes(const std::string &path)
@@ -231,6 +299,17 @@ std::string FormatRatio(std::uint64_t outputBytes, std::uint64_t inputBytes)
    return os.str();
 }
 
+std::string FormatPageRatio(const FilterStatsSummary &filters)
+{
+   if (!filters.fPageRatioValid)
+      return "n/a";
+   std::ostringstream os;
+   os.setf(std::ios::fixed);
+   os.precision(3);
+   os << filters.fPageRatio;
+   return os.str();
+}
+
 std::string FormatPct(double pct)
 {
    std::ostringstream os;
@@ -240,212 +319,140 @@ std::string FormatPct(double pct)
    return os.str();
 }
 
-std::string RequireArg(int &i, int argc, char **argv, const char *opt)
+bool ParseAutoCodecName(const std::string &name, unsigned &bit)
 {
-   if (i + 1 >= argc)
-      throw std::runtime_error(std::string(opt) + " requires an argument");
-   return argv[++i];
+   if (name == "beam" || name == "lz") {
+      bit = kSpectra8CodecBit(kSpectra8CodecBeam);
+      return true;
+   }
+   if (name == "bwt" || name == "prism") {
+      bit = kSpectra8CodecBit(kSpectra8CodecBwt);
+      return true;
+   }
+   if (name == "zstd") {
+      bit = kSpectra8CodecBit(kSpectra8CodecZstd);
+      return true;
+   }
+   if (name == "bzip3") {
+      bit = kSpectra8CodecBit(kSpectra8CodecBzip3);
+      return true;
+   }
+   if (name == "lzma" || name == "xz") {
+      bit = kSpectra8CodecBit(kSpectra8CodecLzma);
+      return true;
+   }
+   if (name == "mosaic") {
+      bit = kSpectra8CodecBit(kSpectra8CodecMosaic);
+      return true;
+   }
+   if (name == "crystal") {
+      bit = kSpectra8CodecBit(kSpectra8CodecCrystal);
+      return true;
+   }
+   if (name == "laser") {
+      bit = kSpectra8CodecBit(kSpectra8CodecLaser);
+      return true;
+   }
+   // Flash and Grating are forced-only backends; Auto never races them.
+   return false;
 }
 
-std::string OptionValue(const std::string &arg, const char *opt, int &i, int argc, char **argv)
+unsigned ParseAutoCodecMask(const std::string &list)
 {
-   const std::string prefix = std::string(opt) + "=";
-   if (arg.rfind(prefix, 0) == 0)
-      return arg.substr(prefix.size());
-   if (arg == opt)
-      return RequireArg(i, argc, argv, opt);
-   return {};
+   if (list == "all")
+      return kSpectra8AutoCodecsAll;
+   if (list == "root" || list.empty())
+      return kSpectra8AutoCodecsRoot;
+
+   unsigned mask = 0;
+   std::size_t pos = 0;
+   while (pos <= list.size()) {
+      const auto end = list.find(',', pos);
+      const auto tok = list.substr(pos, (end == std::string::npos ? list.size() : end) - pos);
+      if (!tok.empty()) {
+         unsigned bit = 0;
+         if (!ParseAutoCodecName(tok, bit))
+            throw std::runtime_error("unknown or non-raceable --auto-codecs token: " + tok);
+         mask |= bit;
+      }
+      if (end == std::string::npos)
+         break;
+      pos = end + 1;
+   }
+   if (mask == 0)
+      throw std::runtime_error("--auto-codecs list is empty");
+   return mask;
 }
 
-int ParseInt(const std::string &text, const char *opt)
+int ParseProfileName(const std::string &name)
 {
-   try {
-      std::size_t idx = 0;
-      const int value = std::stoi(text, &idx);
-      if (idx != text.size())
-         throw std::invalid_argument("trailing");
-      return value;
-   } catch (const std::exception &) {
-      throw std::runtime_error(std::string(opt) + " expects an integer");
+   if (name == "none" || name == "off" || name == "dynamic")
+      return kSpectra8ProfileNone;
+   if (name == "float" || name == "float-kinematics" || name == "kinematics")
+      return kSpectra8ProfileFloatKinematics;
+   if (name == "poisson" || name == "poisson-counts" || name == "counts")
+      return kSpectra8ProfilePoissonCounts;
+   if (name == "monotonic" || name == "int-monotonic" || name == "int")
+      return kSpectra8ProfileIntMonotonic;
+   if (name == "text" || name == "json")
+      return kSpectra8ProfileText;
+   if (name == "custom")
+      return kSpectra8ProfileCustom;
+   throw std::runtime_error("unknown --profile: " + name + " (none, float, poisson, monotonic, text, custom)");
+}
+
+const char *FormatProfileName(int profile)
+{
+   switch (profile) {
+   case kSpectra8ProfileFloatKinematics: return "float";
+   case kSpectra8ProfilePoissonCounts: return "poisson";
+   case kSpectra8ProfileIntMonotonic: return "monotonic";
+   case kSpectra8ProfileText: return "text";
+   case kSpectra8ProfileCustom: return "custom";
+   default: return "none";
    }
 }
 
-std::uint64_t ParseU64(const std::string &text, const char *opt)
+std::string FormatCrystalProfileStatus(const RunOptions &opts)
 {
-   try {
-      std::size_t idx = 0;
-      const auto value = std::stoull(text, &idx);
-      if (idx != text.size())
-         throw std::invalid_argument("trailing");
-      return value;
-   } catch (const std::exception &) {
-      throw std::runtime_error(std::string(opt) + " expects a positive integer");
+   std::string profileFlavour = "per column";
+   if (opts.fProfile != kSpectra8ProfileNone) {
+      profileFlavour = FormatProfileName(opts.fProfile);
+      if (opts.fProfileId != 0)
+         profileFlavour += " (id " + std::to_string(opts.fProfileId) + ")";
+      profileFlavour += " (all columns)";
    }
+   return "spectra8_crystal5 dynamic; spectra8_crystal_profile5 " + profileFlavour;
 }
 
-double ParseDouble(const std::string &text, const char *opt)
+std::string FormatAutoCodecMask(unsigned mask)
 {
-   try {
-      std::size_t idx = 0;
-      const double value = std::stod(text, &idx);
-      if (idx != text.size())
-         throw std::invalid_argument("trailing");
-      return value;
-   } catch (const std::exception &) {
-      throw std::runtime_error(std::string(opt) + " expects a number");
-   }
-}
+   if (mask == kSpectra8AutoCodecsRoot)
+      return "root (zstd,beam,crystal)";
+   if (mask == kSpectra8AutoCodecsAll)
+      return "all";
 
-const Spec *FindSpec(const std::string &family)
-{
-   for (const auto &spec : kSpecs) {
-      if (family == spec.fFamily)
-         return &spec;
-   }
-   return nullptr;
-}
-
-std::optional<int> SplitLevelSuffix(const std::string &token, std::string &family)
-{
-   std::size_t i = token.size();
-   while (i > 0 && std::isdigit(static_cast<unsigned char>(token[i - 1])))
-      --i;
-   if (i == token.size()) {
-      family = token;
-      return std::nullopt;
-   }
-   if (i == 0)
-      throw std::runtime_error("unknown variant label: " + token);
-   family = token.substr(0, i);
-   return std::stoi(token.substr(i));
-}
-
-std::string KnownFamilies()
-{
+   struct Row {
+      const char *fName;
+      unsigned fBit;
+   };
+   static constexpr Row kRows[] = {{"zstd", kSpectra8CodecBit(kSpectra8CodecZstd)},
+                                   {"beam", kSpectra8CodecBit(kSpectra8CodecBeam)},
+                                   {"crystal", kSpectra8CodecBit(kSpectra8CodecCrystal)},
+                                   {"mosaic", kSpectra8CodecBit(kSpectra8CodecMosaic)},
+                                   {"prism", kSpectra8CodecBit(kSpectra8CodecBwt)},
+                                   {"laser", kSpectra8CodecBit(kSpectra8CodecLaser)},
+                                   {"lzma", kSpectra8CodecBit(kSpectra8CodecLzma)},
+                                   {"bzip3", kSpectra8CodecBit(kSpectra8CodecBzip3)}};
    std::string out;
-   for (const auto &spec : kSpecs) {
-      if (!out.empty())
-         out += ", ";
-      out += spec.fFamily;
-   }
-   return out;
-}
-
-void CheckLevel(const Spec &spec, int level)
-{
-   if (!spec.fCompressed)
-      throw std::runtime_error(std::string(spec.fFamily) + " has no compression level");
-   if (level < 1)
-      throw std::runtime_error("compression level must be >= 1");
-   if (spec.fAlgorithm == EAlgorithm::kZSTD) {
-      if (level > 19)
-         throw std::runtime_error("zstd level must be between 1 and 19");
-   } else if (level > 9) {
-      throw std::runtime_error(std::string(spec.fFamily) + " level must be between 1 and 9");
-   }
-}
-
-int ResolveLevel(const Spec &spec, const std::optional<int> &requested, const RunOptions &opts,
-                 const std::string &label)
-{
-   if (!spec.fCompressed) {
-      if (requested)
-         throw std::runtime_error(label + " has no compression level");
-      return 0;
-   }
-   if (requested && opts.fLevelExplicit && *requested != opts.fLevel) {
-      throw std::runtime_error(label + " asks for level " + std::to_string(*requested) + " but --level is " +
-                               std::to_string(opts.fLevel));
-   }
-   int level = spec.fDefaultLevel;
-   if (opts.fLevelExplicit)
-      level = opts.fLevel;
-   if (requested)
-      level = *requested;
-   CheckLevel(spec, level);
-   return level;
-}
-
-std::vector<Request> ParseRequests(const std::string &only)
-{
-   std::vector<Request> requests;
-   if (only.empty()) {
-      for (const auto &spec : kSpecs) {
-         if (spec.fCompressed)
-            requests.push_back(Request{&spec, std::nullopt});
-      }
-      return requests;
-   }
-
-   std::stringstream ss(only);
-   std::string item;
-   while (std::getline(ss, item, ',')) {
-      const auto begin = item.find_first_not_of(" \t");
-      if (begin == std::string::npos)
+   for (const auto &row : kRows) {
+      if (!(mask & row.fBit))
          continue;
-      const auto end = item.find_last_not_of(" \t");
-      item = item.substr(begin, end - begin + 1);
-      std::string family;
-      const auto level = SplitLevelSuffix(item, family);
-      const Spec *spec = FindSpec(family);
-      if (!spec)
-         throw std::runtime_error("unknown variant label: " + item + " (known: " + KnownFamilies() + ")");
-      requests.push_back(Request{spec, level});
+      if (!out.empty())
+         out += ',';
+      out += row.fName;
    }
-   if (requests.empty())
-      throw std::runtime_error("--only-variant list is empty");
-   return requests;
-}
-
-void ApplyPageSizeOptions(RNTupleWriteOptions &writeOpts, const RunOptions &runOpts)
-{
-   if (runOpts.fPageSize)
-      writeOpts.SetMaxUnzippedPageSize(*runOpts.fPageSize);
-
-   if (runOpts.fInitialPageSize) {
-      writeOpts.SetInitialUnzippedPageSize(*runOpts.fInitialPageSize);
-      // ReservePage() allocates one initial buffer per column. Scale the auto budget only when
-      // the user raises the initial page size above the ROOT default (256 B).
-      constexpr std::size_t kDefaultInitialPageSize = 256;
-      if (*runOpts.fInitialPageSize > kDefaultInitialPageSize) {
-         std::size_t autoBudget = writeOpts.GetApproxZippedClusterSize();
-         if (writeOpts.GetCompression() != 0)
-            autoBudget += writeOpts.GetApproxZippedClusterSize();
-         writeOpts.SetPageBufferBudget(autoBudget * (*runOpts.fInitialPageSize) / kDefaultInitialPageSize);
-      }
-   }
-}
-
-std::string FormatPageSizeSettings(const RunOptions &opts)
-{
-   if (!opts.fPageSize && !opts.fInitialPageSize)
-      return "default (initial=256 B, max=1 MiB)";
-   const auto initial = opts.fInitialPageSize ? FormatBytes(*opts.fInitialPageSize) : std::string("256 B (default)");
-   const auto maxSize = opts.fPageSize ? FormatBytes(*opts.fPageSize) : std::string("1 MiB (default)");
-   return "initial=" + initial + ", max=" + maxSize;
-}
-
-std::vector<Variant> MakeVariants(const RunOptions &opts)
-{
-   std::vector<Variant> variants;
-   for (const auto &request : ParseRequests(opts.fOnlyVariant)) {
-      const int level = ResolveLevel(*request.fSpec, request.fLevel, opts, request.fSpec->fFamily);
-      Variant variant;
-      variant.fFamily = request.fSpec->fFamily;
-      variant.fLevel = level;
-      if (request.fSpec->fCompressed) {
-         variant.fLabel = variant.fFamily + std::to_string(level);
-         variant.fSuffix = std::string(request.fSpec->fSuffix) + std::to_string(level);
-         variant.fOptions.SetCompression(request.fSpec->fAlgorithm, level);
-      } else {
-         variant.fLabel = variant.fFamily;
-         variant.fSuffix = request.fSpec->fSuffix;
-         variant.fOptions.SetCompression(0);
-      }
-      ApplyPageSizeOptions(variant.fOptions, opts);
-      variants.push_back(std::move(variant));
-   }
-   return variants;
+   return out.empty() ? "none" : out;
 }
 
 std::string FindFirstTreeName(const std::string &fileName)
@@ -453,6 +460,7 @@ std::string FindFirstTreeName(const std::string &fileName)
    auto file = std::unique_ptr<TFile>(TFile::Open(fileName.c_str()));
    if (!file || file->IsZombie())
       throw std::runtime_error("cannot open input file: " + fileName);
+
    TIter next(file->GetListOfKeys());
    while (auto key = static_cast<TKey *>(next())) {
       if (std::strcmp(key->GetClassName(), "TTree") == 0)
@@ -461,106 +469,9 @@ std::string FindFirstTreeName(const std::string &fileName)
    throw std::runtime_error("no TTree found in " + fileName);
 }
 
-RunOptions ParseArgs(int argc, char **argv)
+bool ParseBoolValue(const std::string &value)
 {
-   RunOptions opts;
-   std::vector<std::string> positional;
-   for (int i = 1; i < argc; ++i) {
-      const std::string arg = argv[i];
-      if (arg == "-h" || arg == "--help") {
-         std::cout << kUsage;
-         std::exit(0);
-      }
-      if (arg == "--no-out") {
-         opts.fNoOut = true;
-         continue;
-      }
-      if (arg == "--quiet") {
-         opts.fQuiet = true;
-         continue;
-      }
-      if (arg == "--bench") {
-         opts.fBench = true;
-         continue;
-      }
-      if (const auto value = OptionValue(arg, "--page-size", i, argc, argv); !value.empty()) {
-         opts.fPageSize = static_cast<std::size_t>(ParseU64(value, "--page-size"));
-         continue;
-      }
-      if (const auto value = OptionValue(arg, "--initial-page-size", i, argc, argv); !value.empty()) {
-         opts.fInitialPageSize = static_cast<std::size_t>(ParseU64(value, "--initial-page-size"));
-         continue;
-      }
-      if (const auto value = OptionValue(arg, "--level", i, argc, argv); !value.empty()) {
-         opts.fLevel = ParseInt(value, "--level");
-         opts.fLevelExplicit = true;
-         continue;
-      }
-      if (const auto value = OptionValue(arg, "--only-variant", i, argc, argv); !value.empty()) {
-         opts.fOnlyVariant = value;
-         continue;
-      }
-      if (const auto value = OptionValue(arg, "--jobs", i, argc, argv); !value.empty()) {
-         opts.fJobs = ParseInt(value, "--jobs");
-         continue;
-      }
-      if (const auto value = OptionValue(arg, "--worker-result", i, argc, argv); !value.empty()) {
-         opts.fWorkerResult = value;
-         continue;
-      }
-      if (const auto value = OptionValue(arg, "--bench-threads", i, argc, argv); !value.empty()) {
-         opts.fBenchThreads = ParseInt(value, "--bench-threads");
-         continue;
-      }
-      if (const auto value = OptionValue(arg, "--bench-iters", i, argc, argv); !value.empty()) {
-         opts.fBenchIters = ParseInt(value, "--bench-iters");
-         continue;
-      }
-      if (const auto value = OptionValue(arg, "--bench-entries", i, argc, argv); !value.empty()) {
-         opts.fBenchEntries = ParseU64(value, "--bench-entries");
-         continue;
-      }
-      if (const auto value = OptionValue(arg, "--bench-percent", i, argc, argv); !value.empty()) {
-         opts.fBenchPercent = ParseDouble(value, "--bench-percent");
-         continue;
-      }
-      if (!arg.empty() && arg[0] == '-')
-         throw std::runtime_error("unknown option: " + arg);
-      positional.push_back(arg);
-   }
-
-   if (positional.empty())
-      throw std::runtime_error("missing input file (see --help)");
-   if (positional.size() > 3)
-      throw std::runtime_error("too many positional arguments (see --help)");
-
-   opts.fInputFile = positional[0];
-   if (positional.size() >= 2)
-      opts.fTreeName = positional[1];
-   else
-      opts.fTreeName = FindFirstTreeName(opts.fInputFile);
-   if (positional.size() == 3)
-      opts.fOutputBase = positional[2];
-   else
-      opts.fOutputBase = BasenameNoExt(opts.fInputFile) + "_ntuple";
-
-   if (opts.fPageSize && *opts.fPageSize == 0)
-      throw std::runtime_error("--page-size must be > 0");
-   if (opts.fInitialPageSize && *opts.fInitialPageSize == 0)
-      throw std::runtime_error("--initial-page-size must be > 0");
-   if (opts.fPageSize && opts.fInitialPageSize && *opts.fInitialPageSize > *opts.fPageSize)
-      throw std::runtime_error("--initial-page-size must not exceed --page-size");
-   if (opts.fJobs < 0)
-      throw std::runtime_error("--jobs must be >= 0");
-   if (opts.fBenchThreads < 0)
-      throw std::runtime_error("--bench-threads must be >= 0");
-   if (opts.fBenchIters < 1)
-      throw std::runtime_error("--bench-iters must be >= 1");
-   if (!(opts.fBenchPercent > 0.0 && opts.fBenchPercent <= 100.0))
-      throw std::runtime_error("--bench-percent must be in (0, 100]");
-   if (!opts.fWorkerResult.empty() && opts.fOnlyVariant.empty())
-      throw std::runtime_error("--worker-result requires --only-variant");
-   return opts;
+   return value == "1" || value == "true" || value == "yes";
 }
 
 void WriteWorkerResult(const std::string &path, const VariantResult &result)
@@ -570,7 +481,25 @@ void WriteWorkerResult(const std::string &path, const VariantResult &result)
       throw std::runtime_error("cannot write worker result: " + path);
    out << "label=" << result.fLabel << '\n';
    out << "output_bytes=" << result.fOutputBytes << '\n';
-   out << "elapsed_sec=" << std::setprecision(std::numeric_limits<double>::max_digits10) << result.fElapsedSec << '\n';
+   out << "elapsed_sec=" << std::setprecision(10) << result.fElapsedSec << '\n';
+   out << "filter_valid=" << (result.fFilters.fValid ? 1 : 0) << '\n';
+   out << "filter_on_pct=" << result.fFilters.fFilterOnPct << '\n';
+   out << "filter_off_pct=" << result.fFilters.fFilterOffPct << '\n';
+   out << "raw_won_pct=" << result.fFilters.fRawWonPct << '\n';
+   out << "no_transform_pct=" << result.fFilters.fNoTransformPct << '\n';
+   out << "page_ratio_valid=" << (result.fFilters.fPageRatioValid ? 1 : 0) << '\n';
+   out << "page_ratio=" << std::setprecision(10) << result.fFilters.fPageRatio << '\n';
+   out << "auto_valid=" << (result.fAutoCodec.fValid ? 1 : 0) << '\n';
+   out << "auto_selections=" << result.fAutoCodec.fSelections << '\n';
+   out << "auto_zstd=" << result.fAutoCodec.fCodecHits[kSpectra8CodecZstd] << '\n';
+   out << "auto_beam=" << result.fAutoCodec.fCodecHits[kSpectra8CodecBeam] << '\n';
+   out << "auto_lz=" << result.fAutoCodec.fCodecHits[kSpectra8CodecBeam] << '\n';
+   out << "auto_mosaic=" << result.fAutoCodec.fCodecHits[kSpectra8CodecMosaic] << '\n';
+   out << "auto_bwt=" << result.fAutoCodec.fCodecHits[kSpectra8CodecBwt] << '\n';
+   out << "auto_lzma=" << result.fAutoCodec.fCodecHits[kSpectra8CodecLzma] << '\n';
+   out << "auto_bzip3=" << result.fAutoCodec.fCodecHits[kSpectra8CodecBzip3] << '\n';
+   out << "auto_crystal=" << result.fAutoCodec.fCodecHits[kSpectra8CodecCrystal] << '\n';
+   out << "auto_laser=" << result.fAutoCodec.fCodecHits[kSpectra8CodecLaser] << '\n';
 }
 
 VariantResult ReadWorkerResult(const std::string &path)
@@ -578,6 +507,7 @@ VariantResult ReadWorkerResult(const std::string &path)
    std::ifstream in(path);
    if (!in)
       throw std::runtime_error("cannot read worker result: " + path);
+
    VariantResult result;
    std::string line;
    while (std::getline(in, line)) {
@@ -592,67 +522,812 @@ VariantResult ReadWorkerResult(const std::string &path)
          result.fOutputBytes = std::stoull(value);
       else if (key == "elapsed_sec")
          result.fElapsedSec = std::stod(value);
+      else if (key == "filter_valid")
+         result.fFilters.fValid = ParseBoolValue(value);
+      else if (key == "filter_on_pct")
+         result.fFilters.fFilterOnPct = std::stod(value);
+      else if (key == "filter_off_pct")
+         result.fFilters.fFilterOffPct = std::stod(value);
+      else if (key == "raw_won_pct")
+         result.fFilters.fRawWonPct = std::stod(value);
+      else if (key == "no_transform_pct")
+         result.fFilters.fNoTransformPct = std::stod(value);
+      else if (key == "page_ratio_valid")
+         result.fFilters.fPageRatioValid = ParseBoolValue(value);
+      else if (key == "page_ratio")
+         result.fFilters.fPageRatio = std::stod(value);
+      else if (key == "auto_valid")
+         result.fAutoCodec.fValid = ParseBoolValue(value);
+      else if (key == "auto_selections")
+         result.fAutoCodec.fSelections = std::stoull(value);
+      else if (key == "auto_zstd")
+         result.fAutoCodec.fCodecHits[kSpectra8CodecZstd] = std::stoull(value);
+      else if (key == "auto_beam" || key == "auto_lz")
+         result.fAutoCodec.fCodecHits[kSpectra8CodecBeam] = std::stoull(value);
+      else if (key == "auto_mosaic")
+         result.fAutoCodec.fCodecHits[kSpectra8CodecMosaic] = std::stoull(value);
+      else if (key == "auto_bwt")
+         result.fAutoCodec.fCodecHits[kSpectra8CodecBwt] = std::stoull(value);
+      else if (key == "auto_lzma")
+         result.fAutoCodec.fCodecHits[kSpectra8CodecLzma] = std::stoull(value);
+      else if (key == "auto_bzip3")
+         result.fAutoCodec.fCodecHits[kSpectra8CodecBzip3] = std::stoull(value);
+      else if (key == "auto_crystal")
+         result.fAutoCodec.fCodecHits[kSpectra8CodecCrystal] = std::stoull(value);
+      else if (key == "auto_laser")
+         result.fAutoCodec.fCodecHits[kSpectra8CodecLaser] = std::stoull(value);
    }
-   if (result.fLabel.empty())
-      throw std::runtime_error("worker result is missing a label: " + path);
    return result;
 }
 
-VariantResult ImportVariant(const RunOptions &opts, const Variant &variant, bool quiet)
+constexpr int kDefaultSpectra8Level = 5;
+constexpr int kMaxSpectra8Level = 11; // spectra8::kMaxLevel
+
+int ParseSpectra8Level(const std::string &text)
 {
-   const std::string outputFile = ResolveVariantOutputPath(opts, variant.fSuffix);
-   RemoveIfExists(outputFile);
-   if (!quiet) {
-      if (opts.fNoOut)
-         std::cout << "Converting " << variant.fLabel << " (--no-out)\n";
-      else
-         std::cout << "Writing " << variant.fLabel << " -> " << outputFile << '\n';
+   int level = 0;
+   try {
+      std::size_t idx = 0;
+      level = std::stoi(text, &idx);
+      if (idx != text.size())
+         throw std::invalid_argument("trailing characters");
+   } catch (const std::exception &) {
+      throw std::runtime_error("--level expects an integer from 1 to " + std::to_string(kMaxSpectra8Level));
+   }
+   if (level < 1 || level > kMaxSpectra8Level)
+      throw std::runtime_error("--level must be between 1 and " + std::to_string(kMaxSpectra8Level));
+   return level;
+}
+
+int TrailingVariantLevel(const std::string &label)
+{
+   if (label.empty() || !std::isdigit(static_cast<unsigned char>(label.back())))
+      return 0;
+   std::size_t i = label.size();
+   while (i > 0 && std::isdigit(static_cast<unsigned char>(label[i - 1])))
+      --i;
+   if (i == 0 || i == label.size())
+      return 0;
+   try {
+      std::size_t idx = 0;
+      const std::string digits = label.substr(i);
+      const int n = std::stoi(digits, &idx);
+      if (idx != digits.size() || n < 1 || n > kMaxSpectra8Level)
+         return 0;
+      return n;
+   } catch (const std::exception &) {
+      return 0;
+   }
+}
+
+bool IsDedicatedLevelVariant(const std::string &label)
+{
+   return label == "spectra8_crystal7" || label == "spectra8_crystal9";
+}
+
+std::string TrimCopy(const std::string &text)
+{
+   const auto start = text.find_first_not_of(" \t");
+   const auto end = text.find_last_not_of(" \t");
+   if (start == std::string::npos || end == std::string::npos)
+      return {};
+   return text.substr(start, end - start + 1);
+}
+
+void InferLevelFromVariantLabels(RunOptions &opts)
+{
+   if (opts.fLevelExplicit || opts.fOnlyVariant.empty())
+      return;
+   std::optional<int> inferred;
+   std::stringstream ss(opts.fOnlyVariant);
+   std::string item;
+   while (std::getline(ss, item, ',')) {
+      item = TrimCopy(item);
+      if (item.empty() || IsDedicatedLevelVariant(item))
+         continue;
+      const int n = TrailingVariantLevel(item);
+      if (n == 0)
+         continue;
+      if (!inferred)
+         inferred = n;
+      else if (*inferred != n)
+         throw std::runtime_error("conflicting levels in --only-variant; pass --level N");
+   }
+   if (inferred)
+      opts.fLevel = *inferred;
+}
+
+RunOptions ParseArgs(int argc, char **argv)
+{
+   RunOptions opts;
+   std::vector<std::string> positional;
+
+   for (int i = 1; i < argc; ++i) {
+      const std::string arg = argv[i];
+      if (arg == "-h" || arg == "--help") {
+         std::cout << kUsage;
+         std::exit(0);
+      }
+      if (arg == "--keep-column-encoding") {
+         opts.fKeepColumnEncoding = true;
+         continue;
+      }
+      if (arg == "--page-size") {
+         if (i + 1 >= argc)
+            throw std::runtime_error("--page-size requires an argument");
+         opts.fPageSize = static_cast<std::size_t>(std::stoull(argv[++i]));
+         continue;
+      }
+      if (arg.rfind("--page-size=", 0) == 0) {
+         opts.fPageSize = static_cast<std::size_t>(std::stoull(arg.substr(12)));
+         continue;
+      }
+      if (arg == "--initial-page-size") {
+         if (i + 1 >= argc)
+            throw std::runtime_error("--initial-page-size requires an argument");
+         opts.fInitialPageSize = static_cast<std::size_t>(std::stoull(argv[++i]));
+         continue;
+      }
+      if (arg.rfind("--initial-page-size=", 0) == 0) {
+         opts.fInitialPageSize = static_cast<std::size_t>(std::stoull(arg.substr(20)));
+         continue;
+      }
+      if (arg == "--level") {
+         if (i + 1 >= argc)
+            throw std::runtime_error("--level requires an argument");
+         opts.fLevel = ParseSpectra8Level(argv[++i]);
+         opts.fLevelExplicit = true;
+         continue;
+      }
+      if (arg.rfind("--level=", 0) == 0) {
+         opts.fLevel = ParseSpectra8Level(arg.substr(8));
+         opts.fLevelExplicit = true;
+         continue;
+      }
+      if (arg == "--auto-min-gain") {
+         if (i + 1 >= argc)
+            throw std::runtime_error("--auto-min-gain requires an argument");
+         opts.fAutoMinGainPct = std::stoi(argv[++i]);
+         continue;
+      }
+      if (arg.rfind("--auto-min-gain=", 0) == 0) {
+         opts.fAutoMinGainPct = std::stoi(arg.substr(16));
+         continue;
+      }
+      if (arg == "--auto-max-level") {
+         opts.fAutoMaxLevel = true;
+         continue;
+      }
+      if (arg == "--auto-codecs") {
+         if (i + 1 >= argc)
+            throw std::runtime_error("--auto-codecs requires an argument");
+         opts.fAutoCodecs = ParseAutoCodecMask(argv[++i]);
+         continue;
+      }
+      if (arg.rfind("--auto-codecs=", 0) == 0) {
+         opts.fAutoCodecs = ParseAutoCodecMask(arg.substr(14));
+         continue;
+      }
+      if (arg == "--profile") {
+         if (i + 1 >= argc)
+            throw std::runtime_error("--profile requires an argument");
+         opts.fProfile = ParseProfileName(argv[++i]);
+         continue;
+      }
+      if (arg.rfind("--profile=", 0) == 0) {
+         opts.fProfile = ParseProfileName(arg.substr(10));
+         continue;
+      }
+      if (arg == "--profile-id") {
+         if (i + 1 >= argc)
+            throw std::runtime_error("--profile-id requires an argument");
+         opts.fProfileId = static_cast<unsigned>(std::stoul(argv[++i]));
+         continue;
+      }
+      if (arg.rfind("--profile-id=", 0) == 0) {
+         opts.fProfileId = static_cast<unsigned>(std::stoul(arg.substr(13)));
+         continue;
+      }
+      if (arg == "--bench") {
+         opts.fBench = true;
+         continue;
+      }
+      if (arg == "--bench-threads") {
+         if (i + 1 >= argc)
+            throw std::runtime_error("--bench-threads requires an argument");
+         opts.fBenchThreads = std::stoi(argv[++i]);
+         continue;
+      }
+      if (arg.rfind("--bench-threads=", 0) == 0) {
+         opts.fBenchThreads = std::stoi(arg.substr(16));
+         continue;
+      }
+      if (arg == "--bench-iters") {
+         if (i + 1 >= argc)
+            throw std::runtime_error("--bench-iters requires an argument");
+         opts.fBenchIters = std::stoi(argv[++i]);
+         continue;
+      }
+      if (arg.rfind("--bench-iters=", 0) == 0) {
+         opts.fBenchIters = std::stoi(arg.substr(14));
+         continue;
+      }
+      if (arg == "--bench-entries") {
+         if (i + 1 >= argc)
+            throw std::runtime_error("--bench-entries requires an argument");
+         opts.fBenchEntries = std::stoull(argv[++i]);
+         continue;
+      }
+      if (arg.rfind("--bench-entries=", 0) == 0) {
+         opts.fBenchEntries = std::stoull(arg.substr(16));
+         continue;
+      }
+      if (arg == "--bench-percent") {
+         if (i + 1 >= argc)
+            throw std::runtime_error("--bench-percent requires an argument");
+         opts.fBenchPercent = std::stod(argv[++i]);
+         if (!(opts.fBenchPercent > 0.0 && opts.fBenchPercent <= 100.0))
+            throw std::runtime_error("--bench-percent must be in (0, 100]");
+         continue;
+      }
+      if (arg.rfind("--bench-percent=", 0) == 0) {
+         opts.fBenchPercent = std::stod(arg.substr(16));
+         if (!(opts.fBenchPercent > 0.0 && opts.fBenchPercent <= 100.0))
+            throw std::runtime_error("--bench-percent must be in (0, 100]");
+         continue;
+      }
+      // Deprecated alias kept for compatibility with the first implementation.
+      if (arg == "--max-page-size") {
+         if (i + 1 >= argc)
+            throw std::runtime_error("--max-page-size requires an argument");
+         opts.fPageSize = static_cast<std::size_t>(std::stoull(argv[++i]));
+         continue;
+      }
+      if (arg.rfind("--max-page-size=", 0) == 0) {
+         opts.fPageSize = static_cast<std::size_t>(std::stoull(arg.substr(16)));
+         continue;
+      }
+      if (arg == "--quiet") {
+         opts.fQuiet = true;
+         continue;
+      }
+      if (arg == "--no-out") {
+         opts.fNoOut = true;
+         continue;
+      }
+      if (arg == "--verify") {
+         opts.fVerify = true;
+         continue;
+      }
+      if (arg == "--jobs") {
+         if (i + 1 >= argc)
+            throw std::runtime_error("--jobs requires an argument");
+         opts.fJobs = std::stoi(argv[++i]);
+         continue;
+      }
+      if (arg.rfind("--jobs=", 0) == 0) {
+         opts.fJobs = std::stoi(arg.substr(7));
+         continue;
+      }
+      if (arg == "--only-variant" || arg == "--only-variants" || arg == "--variants") {
+         if (i + 1 >= argc)
+            throw std::runtime_error("--only-variant requires an argument");
+         opts.fOnlyVariant = argv[++i];
+         continue;
+      }
+      if (arg.rfind("--only-variant=", 0) == 0) {
+         opts.fOnlyVariant = arg.substr(15);
+         continue;
+      }
+      if (arg.rfind("--only-variants=", 0) == 0) {
+         opts.fOnlyVariant = arg.substr(16);
+         continue;
+      }
+      if (arg.rfind("--variants=", 0) == 0) {
+         opts.fOnlyVariant = arg.substr(11);
+         continue;
+      }
+      if (arg == "--worker-result") {
+         if (i + 1 >= argc)
+            throw std::runtime_error("--worker-result requires an argument");
+         opts.fWorkerResult = argv[++i];
+         continue;
+      }
+      if (arg.rfind("--worker-result=", 0) == 0) {
+         opts.fWorkerResult = arg.substr(16);
+         continue;
+      }
+      if (!arg.empty() && arg[0] == '-') {
+         throw std::runtime_error("unknown option: " + arg);
+      }
+      positional.push_back(arg);
    }
 
+   if (positional.empty())
+      throw std::runtime_error("missing input file (see --help)");
+
+   opts.fInputFile = positional[0];
+   if (positional.size() >= 2)
+      opts.fTreeName = positional[1];
+   else
+      opts.fTreeName = FindFirstTreeName(opts.fInputFile);
+
+   if (positional.size() >= 3)
+      opts.fOutputBase = positional[2];
+   else
+      opts.fOutputBase = BasenameNoExt(opts.fInputFile) + "_ntuple";
+
+   if (positional.size() > 3)
+      throw std::runtime_error("too many positional arguments (see --help)");
+
+   if (opts.fPageSize && *opts.fPageSize == 0)
+      throw std::runtime_error("--page-size must be > 0");
+   if (opts.fInitialPageSize && *opts.fInitialPageSize == 0)
+      throw std::runtime_error("--initial-page-size must be > 0");
+   if (opts.fPageSize && opts.fInitialPageSize && *opts.fInitialPageSize > *opts.fPageSize)
+      throw std::runtime_error("--initial-page-size must not exceed --page-size");
+   if (opts.fAutoMinGainPct && *opts.fAutoMinGainPct < 0)
+      throw std::runtime_error("--auto-min-gain must be >= 0");
+
+   InferLevelFromVariantLabels(opts);
+
+   return opts;
+}
+
+int ResolveAutoMinGainPct(const RunOptions &opts)
+{
+   return opts.fAutoMinGainPct ? *opts.fAutoMinGainPct : 1;
+}
+
+bool ResolveAutoMaxLevel(const RunOptions &opts)
+{
+   return opts.fAutoMaxLevel;
+}
+
+unsigned ResolveAutoCodecs(const RunOptions &opts)
+{
+   return opts.fAutoCodecs ? *opts.fAutoCodecs : kSpectra8AutoCodecsRoot;
+}
+
+void ApplyPageSizeOptions(RNTupleWriteOptions &writeOpts, const RunOptions &runOpts)
+{
+   if (runOpts.fPageSize)
+      writeOpts.SetMaxUnzippedPageSize(*runOpts.fPageSize);
+
+   if (runOpts.fInitialPageSize) {
+      writeOpts.SetInitialUnzippedPageSize(*runOpts.fInitialPageSize);
+
+      // ReservePage() allocates one initial buffer per column. Scale the auto budget only when
+      // the user deliberately raises the initial page size above the ROOT default (256 B).
+      constexpr std::size_t kDefaultInitialPageSize = 256;
+      if (*runOpts.fInitialPageSize > kDefaultInitialPageSize) {
+         std::size_t autoBudget = writeOpts.GetApproxZippedClusterSize();
+         if (writeOpts.GetCompression() != 0)
+            autoBudget += writeOpts.GetApproxZippedClusterSize();
+         writeOpts.SetPageBufferBudget(autoBudget * (*runOpts.fInitialPageSize) / kDefaultInitialPageSize);
+      }
+   }
+}
+
+std::string FormatPageSizeSettings(const RunOptions &opts)
+{
+   if (!opts.fPageSize && !opts.fInitialPageSize)
+      return "default (initial=256 B, max=1 MiB)";
+
+   const auto initial =
+      opts.fInitialPageSize ? FormatBytes(*opts.fInitialPageSize) : std::string("256 B (default)");
+   const auto max = opts.fPageSize ? FormatBytes(*opts.fPageSize) : std::string("1 MiB (default)");
+   return "initial=" + initial + ", max=" + max;
+}
+
+void AppendPageSizeArgs(std::vector<std::string> &args, const RunOptions &opts)
+{
+   if (opts.fPageSize) {
+      args.emplace_back("--page-size");
+      args.push_back(std::to_string(*opts.fPageSize));
+   }
+   if (opts.fInitialPageSize) {
+      args.emplace_back("--initial-page-size");
+      args.push_back(std::to_string(*opts.fInitialPageSize));
+   }
+}
+
+void AppendLevelArgs(std::vector<std::string> &args, const RunOptions &opts)
+{
+   args.emplace_back("--level");
+   args.push_back(std::to_string(opts.fLevel));
+}
+
+void AppendAutoMinGainArgs(std::vector<std::string> &args, const RunOptions &opts)
+{
+   if (opts.fAutoMinGainPct) {
+      args.emplace_back("--auto-min-gain");
+      args.push_back(std::to_string(*opts.fAutoMinGainPct));
+   }
+}
+
+void AppendAutoMaxLevelArgs(std::vector<std::string> &args, const RunOptions &opts)
+{
+   if (opts.fAutoMaxLevel)
+      args.emplace_back("--auto-max-level");
+}
+
+void AppendAutoCodecsArgs(std::vector<std::string> &args, const RunOptions &opts)
+{
+   if (!opts.fAutoCodecs)
+      return;
+   args.emplace_back("--auto-codecs");
+   if (*opts.fAutoCodecs == kSpectra8AutoCodecsAll)
+      args.emplace_back("all");
+   else if (*opts.fAutoCodecs == kSpectra8AutoCodecsRoot)
+      args.emplace_back("root");
+   else
+      args.push_back(FormatAutoCodecMask(*opts.fAutoCodecs));
+}
+
+void AppendProfileArgs(std::vector<std::string> &args, const RunOptions &opts)
+{
+   if (opts.fProfile == kSpectra8ProfileNone && opts.fProfileId == 0)
+      return;
+   args.emplace_back("--profile");
+   args.emplace_back(FormatProfileName(opts.fProfile));
+   if (opts.fProfileId != 0) {
+      args.emplace_back("--profile-id");
+      args.push_back(std::to_string(opts.fProfileId));
+   }
+}
+
+void AppendNoOutArgs(std::vector<std::string> &args, const RunOptions &opts)
+{
+   if (opts.fNoOut)
+      args.emplace_back("--no-out");
+}
+
+void AppendVerifyArgs(std::vector<std::string> &args, const RunOptions &opts)
+{
+   if (opts.fVerify)
+      args.emplace_back("--verify");
+}
+
+struct ZipVerifyGuard {
+   explicit ZipVerifyGuard(bool enable) { ROOT::Internal::RNTupleCompressor::SetVerifyRoundtrip(enable); }
+   ~ZipVerifyGuard() { ROOT::Internal::RNTupleCompressor::SetVerifyRoundtrip(false); }
+   ZipVerifyGuard(const ZipVerifyGuard &) = delete;
+   ZipVerifyGuard &operator=(const ZipVerifyGuard &) = delete;
+};
+
+#ifdef R__HAS_SPECTRA8
+void ResetSpectra8Globals(int autoMinGainPct, bool autoMaxLevel, unsigned autoCodecs)
+{
+   R__SetSpectra8Codec(kSpectra8CodecBeam);
+   R__SetSpectra8Filters(0);
+   R__SetSpectra8FilterFallback(1);
+   R__SetSpectra8FilterRle(1);
+   R__SetSpectra8FilterDict(1);
+   R__SetSpectra8AutoMinGainPct(autoMinGainPct);
+   R__SetSpectra8AutoMaxLevel(autoMaxLevel ? 1 : 0);
+   R__SetSpectra8AutoCodecs(autoCodecs);
+   R__SetSpectra8Profile(kSpectra8ProfileNone);
+   R__SetSpectra8ProfileId(0);
+   R__SetSpectra8ProfilePerColumn(0);
+}
+
+RNTupleWriteOptions MakeSpectra8WriteOptions(int level, bool keepColumnEncoding)
+{
+   RNTupleWriteOptions opts;
+   opts.SetEnableColumnEncoding(keepColumnEncoding);
+   opts.SetCompression(ROOT::RCompressionSetting::EAlgorithm::kSpectra8, level);
+   return opts;
+}
+
+void ConfigureSpectra8FilterGlobals(int codec, bool enableByteFilters, int autoMinGainPct, bool autoMaxLevel,
+                                unsigned autoCodecs, int profile, unsigned profileId, bool profilePerColumn)
+{
+   ResetSpectra8Globals(autoMinGainPct, autoMaxLevel, autoCodecs);
+   R__SetSpectra8Codec(codec);
+   if (enableByteFilters)
+      R__SetSpectra8Filters(1);
+   // Standard Crystal stays dynamic. The profile flavour opts into static models.
+   if (codec == kSpectra8CodecCrystal && profilePerColumn) {
+      if (profile != kSpectra8ProfileNone) {
+         R__SetSpectra8Profile(profile);
+         R__SetSpectra8ProfileId(profileId);
+      } else {
+         R__SetSpectra8ProfilePerColumn(1);
+      }
+   }
+}
+
+FilterStatsSummary ReadFilterStatsSummary()
+{
+   R__Spectra8CompressStatsSummary stats{};
+   R__GetSpectra8CompressStatsSummary(&stats);
+   FilterStatsSummary out;
+   if (stats.num_pages == 0)
+      return out;
+   out.fValid = true;
+   const double denom = static_cast<double>(stats.num_pages);
+   out.fFilterOnPct = 100.0 * static_cast<double>(stats.filtered_won_pages) / denom;
+   const auto filterOff = stats.raw_won_pages + stats.no_transform_pages + stats.stored_fallback_pages +
+                          stats.plain_pages;
+   out.fFilterOffPct = 100.0 * static_cast<double>(filterOff) / denom;
+   out.fRawWonPct = 100.0 * static_cast<double>(stats.raw_won_pages) / denom;
+   out.fNoTransformPct = 100.0 * static_cast<double>(stats.no_transform_pages) / denom;
+   if (stats.uncompressed_bytes > 0) {
+      out.fPageRatioValid = true;
+      out.fPageRatio = static_cast<double>(stats.compressed_bytes) /
+                       static_cast<double>(stats.uncompressed_bytes);
+   }
+   return out;
+}
+
+AutoCodecStatsSummary ReadAutoCodecStatsSummary()
+{
+   R__Spectra8AutoCodecStatsSummary stats{};
+   R__GetSpectra8AutoCodecStatsSummary(&stats);
+   AutoCodecStatsSummary out;
+   if (stats.auto_selections == 0)
+      return out;
+   out.fValid = true;
+   out.fSelections = stats.auto_selections;
+   for (int i = 0; i < kSpectra8CodecCount; ++i)
+      out.fCodecHits[i] = stats.codec_hits[i];
+   return out;
+}
+#endif
+
+struct Variant {
+   const char *fLabel = nullptr;
+   std::string fSuffix;
+   RNTupleWriteOptions fOptions;
+   bool fUsesSpectra8Globals = false;
+   bool fEnableSpectra8ByteFilters = false;
+   int fSpectra8Codec = 0;
+   bool fRequireCodecAvailable = false;
+   bool fSpectra8ProfilePerColumn = false;
+};
+
+const Variant *FindVariant(const std::vector<Variant> &variants, const std::string &label);
+
+RNTupleWriteOptions MakeNativeWriteOptions(ROOT::RCompressionSetting::EAlgorithm::EValues algorithm, int level)
+{
+   RNTupleWriteOptions opts;
+   opts.SetCompression(algorithm, level);
+   return opts;
+}
+
+std::vector<Variant> MakeVariants(const RunOptions &runOpts)
+{
+   std::vector<Variant> variants;
+
+   variants.push_back({"native_zstd", "_native",
+                       MakeNativeWriteOptions(ROOT::RCompressionSetting::EAlgorithm::kZSTD,
+                                              ROOT::RCompressionSetting::ELevel::kDefaultZSTD),
+                       false, false, 0, false});
+   variants.push_back({"native_lzma", "_native_lzma",
+                       MakeNativeWriteOptions(ROOT::RCompressionSetting::EAlgorithm::kLZMA,
+                                              ROOT::RCompressionSetting::ELevel::kDefaultLZMA),
+                       false, false, 0, false});
+
+#ifdef R__HAS_SPECTRA8
+   const int kLevel = runOpts.fLevel;
+   const auto spectra8Opts = MakeSpectra8WriteOptions(kLevel, runOpts.fKeepColumnEncoding);
+   const std::string lv = std::to_string(kLevel);
+
+   variants.push_back({"spectra8_zstd", "_spectra8_zstd", spectra8Opts, true, true, kSpectra8CodecZstd, true});
+   variants.push_back({"spectra8_bzip3", "_spectra8_bzip3", spectra8Opts, true, true, kSpectra8CodecBzip3, true});
+   variants.push_back({"spectra8_beam5", "_spectra8_beam" + lv, spectra8Opts, true, true, kSpectra8CodecBeam, false});
+   variants.push_back({"spectra8_mosaic5", "_spectra8_mosaic" + lv, spectra8Opts, true, true, kSpectra8CodecMosaic, false});
+   variants.push_back({"spectra8_prism5", "_spectra8_prism" + lv, spectra8Opts, true, true, kSpectra8CodecBwt, false});
+   variants.push_back({"spectra8_crystal5", "_spectra8_crystal" + lv, spectra8Opts, true, true, kSpectra8CodecCrystal, false});
+   variants.push_back({"spectra8_crystal_profile5", "_spectra8_crystal_profile" + lv, spectra8Opts, true, true, kSpectra8CodecCrystal,
+                       false, true});
+
+   // Extra Crystal 7/9 comparison variants only at the default level so suffixes do not collide.
+   if (kLevel == kDefaultSpectra8Level) {
+      const auto spectra8Opts7 = MakeSpectra8WriteOptions(7, runOpts.fKeepColumnEncoding);
+      variants.push_back({"spectra8_crystal7", "_spectra8_crystal7", spectra8Opts7, true, true, kSpectra8CodecCrystal, false});
+
+      const auto spectra8Opts9 = MakeSpectra8WriteOptions(9, runOpts.fKeepColumnEncoding);
+      variants.push_back({"spectra8_crystal9", "_spectra8_crystal9", spectra8Opts9, true, true, kSpectra8CodecCrystal, false});
+   }
+
+   variants.push_back({"spectra8_oracle5", "_spectra8_oracle" + lv, spectra8Opts, true, true, kSpectra8CodecOracle, false});
+   variants.push_back({"spectra8_flash5", "_spectra8_flash" + lv, spectra8Opts, true, true, kSpectra8CodecFlash, false});
+   variants.push_back({"spectra8_laser5", "_spectra8_laser" + lv, spectra8Opts, true, true, kSpectra8CodecLaser, false});
+   // Grating has no levels (the model does not search); the RNTuple level is ignored.
+   variants.push_back({"spectra8_grating", "_spectra8_grating", spectra8Opts, true, true, kSpectra8CodecGrating, false});
+   variants.push_back({"spectra8_auto", "_spectra8_auto", spectra8Opts, true, true, kSpectra8CodecAuto, false});
+#endif
+
+   for (auto &variant : variants)
+      ApplyPageSizeOptions(variant.fOptions, runOpts);
+
+   if (!runOpts.fOnlyVariant.empty() && runOpts.fWorkerResult.empty()) {
+      std::unordered_set<std::string> requested;
+      std::stringstream ss(runOpts.fOnlyVariant);
+      std::string item;
+      while (std::getline(ss, item, ',')) {
+         item = TrimCopy(item);
+         if (!item.empty())
+            requested.insert(item);
+      }
+      std::unordered_set<std::string> requestedCanon;
+      for (const auto &req : requested) {
+         const Variant *match = FindVariant(variants, req);
+         if (!match)
+            throw std::runtime_error("unknown variant label: " + req);
+         requestedCanon.insert(match->fLabel);
+      }
+      std::vector<Variant> filtered;
+      for (const auto &v : variants) {
+         if (requestedCanon.count(v.fLabel))
+            filtered.push_back(v);
+      }
+      return filtered;
+   }
+
+   return variants;
+}
+
+const Variant *FindVariant(const std::vector<Variant> &variants, const std::string &label)
+{
+   std::string resolved = label;
+   if (resolved == "spectra8_lz5" || resolved == "spectra8_lz" || resolved == "spectra8_beam")
+      resolved = "spectra8_beam5";
+   for (const auto &variant : variants) {
+      if (resolved == variant.fLabel)
+         return &variant;
+   }
+   const int n = TrailingVariantLevel(resolved);
+   std::string family = resolved;
+   if (n > 0)
+      family = resolved.substr(0, resolved.size() - std::to_string(n).size());
+   if (family.empty())
+      return nullptr;
+   const std::string fallback = family + std::to_string(kDefaultSpectra8Level);
+   for (const auto &variant : variants) {
+      if (fallback == variant.fLabel)
+         return &variant;
+   }
+   for (const auto &variant : variants) {
+      if (family == variant.fLabel)
+         return &variant;
+   }
+   return nullptr;
+}
+
+std::optional<VariantResult> ImportVariant(const std::string &inputFile, const std::string &treeName,
+                                           const std::string &outputFile, const Variant &variant, bool quiet,
+                                           int autoMinGainPct, bool autoMaxLevel, unsigned autoCodecs, int profile,
+                                           unsigned profileId, bool discardOutput, bool verify)
+{
+#ifdef R__HAS_SPECTRA8
+   if (variant.fUsesSpectra8Globals) {
+      if (variant.fRequireCodecAvailable && !R__Spectra8CodecAvailable(variant.fSpectra8Codec)) {
+         if (!quiet)
+            std::cerr << "Skipping " << variant.fLabel << ": spectra8 backend is not available in this build\n";
+         return std::nullopt;
+      }
+      ConfigureSpectra8FilterGlobals(variant.fSpectra8Codec, variant.fEnableSpectra8ByteFilters, autoMinGainPct, autoMaxLevel,
+                                 autoCodecs, profile, profileId, variant.fSpectra8ProfilePerColumn);
+   } else {
+      ResetSpectra8Globals(autoMinGainPct, autoMaxLevel, autoCodecs);
+   }
+#else
+   if (variant.fUsesSpectra8Globals) {
+      if (!quiet)
+         std::cerr << "Skipping " << variant.fLabel << ": ROOT was built without spectra8 support\n";
+      return std::nullopt;
+   }
+#endif
+
+   RemoveIfExists(outputFile);
+   if (!quiet) {
+      if (discardOutput)
+         std::cout << "Converting " << variant.fLabel << " (--no-out)" << std::endl;
+      else
+         std::cout << "Writing " << variant.fLabel << " -> " << outputFile << std::endl;
+   }
+
+#ifdef R__HAS_SPECTRA8
+   if (variant.fUsesSpectra8Globals)
+      R__ResetSpectra8CompressStats();
+#endif
+
    const auto t0 = std::chrono::steady_clock::now();
-   auto importer = RNTupleImporter::Create(opts.fInputFile, opts.fTreeName, outputFile);
+
+   ZipVerifyGuard verifyGuard(verify);
+   auto importer = RNTupleImporter::Create(inputFile, treeName, outputFile);
    importer->SetWriteOptions(variant.fOptions);
    if (quiet)
       importer->SetIsQuiet(true);
    importer->Import();
+
    const auto t1 = std::chrono::steady_clock::now();
+   const std::chrono::duration<double> elapsed = t1 - t0;
+
+   const auto report = importer->GetLastImportReport();
+
+#ifdef R__HAS_SPECTRA8
+   if (variant.fUsesSpectra8Globals && !quiet) {
+      std::cout << "Compression statistics (" << variant.fLabel << "):\n";
+      R__PrintSpectra8CompressStats();
+   }
+#endif
+
+   if (!quiet)
+      std::cout << "  done\n";
 
    VariantResult result;
    result.fLabel = variant.fLabel;
-   result.fElapsedSec = std::chrono::duration<double>(t1 - t0).count();
-   result.fOutputBytes = importer->GetLastImportReport().fFileBytesOnDisk;
+   result.fElapsedSec = elapsed.count();
+   result.fOutputBytes = report.fFileBytesOnDisk;
    if (result.fOutputBytes == 0) {
       if (const auto size = FileSizeBytes(outputFile))
          result.fOutputBytes = *size;
    }
-   if (!quiet)
-      std::cout << "  done\n";
-   if (opts.fNoOut)
+#ifdef R__HAS_SPECTRA8
+   if (variant.fUsesSpectra8Globals)
+      result.fFilters = ReadFilterStatsSummary();
+   if (std::strcmp(variant.fLabel, "spectra8_auto") == 0)
+      result.fAutoCodec = ReadAutoCodecStatsSummary();
+#endif
+   if (discardOutput)
       RemoveIfExists(outputFile);
    return result;
 }
 
-std::uint64_t FindNativeZstdBytes(const std::vector<VariantResult> &results)
+std::string FormatGainVsNativeZstd(const VariantResult &row, std::uint64_t nativeZstdBytes)
+{
+   if (row.fLabel == "native_zstd")
+      return "0.0%";
+   if (nativeZstdBytes == 0)
+      return "n/a";
+   const double gain = 100.0 *
+                       (static_cast<double>(nativeZstdBytes) - static_cast<double>(row.fOutputBytes)) /
+                       static_cast<double>(nativeZstdBytes);
+   return FormatPct(gain);
+}
+
+std::uint64_t FindNativeZstdOutputBytes(const std::vector<VariantResult> &results)
 {
    for (const auto &row : results) {
-      if (row.fLabel.rfind("native_zstd", 0) == 0)
+      if (row.fLabel == "native_zstd")
          return row.fOutputBytes;
    }
    return 0;
 }
 
-std::string FormatGain(const VariantResult &row, std::uint64_t nativeZstdBytes)
+void PrintAutoCodecSummary(const AutoCodecStatsSummary &stats)
 {
-   if (row.fLabel.rfind("native_zstd", 0) == 0)
-      return "0.0%";
-   if (nativeZstdBytes == 0)
-      return "n/a";
-   const double gain = 100.0 * (static_cast<double>(nativeZstdBytes) - static_cast<double>(row.fOutputBytes)) /
-                       static_cast<double>(nativeZstdBytes);
-   return FormatPct(gain);
+   if (!stats.fValid)
+      return;
+
+   std::cout << "\nspectra8_auto backend mix (" << stats.fSelections << " page"
+             << (stats.fSelections == 1 ? "" : "s") << "):\n";
+
+   struct Row {
+      const char *fName;
+      int fCodec;
+   };
+   static constexpr Row kOrder[] = {{"zstd", kSpectra8CodecZstd},     {"beam", kSpectra8CodecBeam},
+                                    {"mosaic", kSpectra8CodecMosaic}, {"prism", kSpectra8CodecBwt},
+                                    {"laser", kSpectra8CodecLaser},   {"lzma", kSpectra8CodecLzma},
+                                    {"bzip3", kSpectra8CodecBzip3},   {"crystal", kSpectra8CodecCrystal}};
+
+   for (const auto &row : kOrder) {
+      const auto n = stats.fCodecHits[row.fCodec];
+      if (n == 0)
+         continue;
+      const double pct = 100.0 * static_cast<double>(n) / static_cast<double>(stats.fSelections);
+      std::cout << "  " << std::left << std::setw(8) << row.fName << std::right << std::setw(8) << n << " ("
+                << std::fixed << std::setprecision(1) << pct << "%)\n";
+   }
 }
 
-void PrintSummaryTable(const RunOptions &opts, std::uint64_t inputBytes, const std::vector<VariantResult> &results)
+void PrintSummaryTable(const RunOptions &opts, std::uint64_t inputBytes,
+                       const std::vector<VariantResult> &results)
 {
    std::cout << "\n=== tree2ntuple summary ===\n";
    std::cout << "Input:  " << opts.fInputFile << " [" << opts.fTreeName << "]\n";
@@ -662,57 +1337,88 @@ void PrintSummaryTable(const RunOptions &opts, std::uint64_t inputBytes, const s
    else
       std::cout << "Output base: " << opts.fOutputBase << '\n';
    std::cout << "Page size: " << FormatPageSizeSettings(opts) << '\n';
-   if (opts.fLevelExplicit)
-      std::cout << "Level: " << opts.fLevel << "\n\n";
-   else
-      std::cout << "Level: per-algorithm defaults\n\n";
+   std::cout << "Spectra8 level: " << opts.fLevel << '\n';
+   std::cout << "Auto min gain: " << ResolveAutoMinGainPct(opts) << "%\n";
+   if (ResolveAutoMaxLevel(opts))
+      std::cout << "Auto max level: on\n";
+   std::cout << "Auto codecs: " << FormatAutoCodecMask(ResolveAutoCodecs(opts)) << '\n';
+   std::cout << "Crystal: " << FormatCrystalProfileStatus(opts) << "\n\n";
 
-   const std::uint64_t nativeZstdBytes = FindNativeZstdBytes(results);
-   constexpr int kLabelWidth = 16;
+   const std::uint64_t nativeZstdBytes = FindNativeZstdOutputBytes(results);
+
+   constexpr int kLabelWidth = 24;
    std::cout << std::left << std::setw(kLabelWidth) << "Format" << std::right << std::setw(12) << "Output"
-             << std::setw(10) << "Ratio" << std::setw(10) << "Gain" << std::setw(10) << "Time" << '\n';
-   std::cout << std::string(kLabelWidth + 12 + 10 + 10 + 10, '-') << '\n';
+             << std::setw(10) << "Ratio" << std::setw(11) << "Page ratio" << std::setw(10) << "Gain"
+             << std::setw(10) << "Time" << std::setw(12) << "Filter on" << std::setw(13) << "Filter off"
+             << std::setw(12) << "Raw won" << std::setw(14) << "No transform" << '\n';
+   std::cout << std::string(kLabelWidth + 12 + 10 + 11 + 10 + 10 + 12 + 13 + 12 + 14, '-') << '\n';
+
    for (const auto &row : results) {
       std::cout << std::left << std::setw(kLabelWidth) << row.fLabel << std::right << std::setw(12)
                 << FormatBytes(row.fOutputBytes) << std::setw(10) << FormatRatio(row.fOutputBytes, inputBytes)
-                << std::setw(10) << FormatGain(row, nativeZstdBytes) << std::setw(10) << FormatSeconds(row.fElapsedSec)
-                << '\n';
+                << std::setw(11) << FormatPageRatio(row.fFilters) << std::setw(10)
+                << FormatGainVsNativeZstd(row, nativeZstdBytes) << std::setw(10)
+                << FormatSeconds(row.fElapsedSec);
+
+      if (row.fFilters.fValid) {
+         std::cout << std::setw(12) << FormatPct(row.fFilters.fFilterOnPct) << std::setw(13)
+                   << FormatPct(row.fFilters.fFilterOffPct) << std::setw(12)
+                   << FormatPct(row.fFilters.fRawWonPct) << std::setw(14)
+                   << FormatPct(row.fFilters.fNoTransformPct);
+      } else {
+         std::cout << std::setw(12) << "n/a" << std::setw(13) << "n/a" << std::setw(12) << "n/a" << std::setw(14)
+                   << "n/a";
+      }
+      std::cout << '\n';
    }
+
    std::cout << "\nRatio = RNTuple output size / TTree input file size (lower is smaller).\n";
-   std::cout << "Gain  = space saved vs native_zstd (positive = smaller file).\n";
+   std::cout << "Page ratio = spectra8 compressed payload / uncompressed page bytes (spectra8_* only).\n";
+   std::cout << "Gain  = space saved vs native_zstd output (positive = smaller file, native_zstd is 0%).\n";
+   std::cout << "Filter on  = spectra8 byte transform kept on wire (filtered won).\n";
+   std::cout << "Filter off = raw won + no transform + stored fallback + plain pages.\n";
+
+   for (const auto &row : results) {
+      if (row.fLabel == "spectra8_auto")
+         PrintAutoCodecSummary(row.fAutoCodec);
+   }
 }
 
 std::vector<VariantResult> RunSequential(const RunOptions &opts)
 {
    std::vector<VariantResult> results;
-   for (const auto &variant : MakeVariants(opts))
-      results.push_back(ImportVariant(opts, variant, opts.fQuiet));
+   for (const auto &variant : MakeVariants(opts)) {
+      if (auto row = ImportVariant(opts.fInputFile, opts.fTreeName, ResolveVariantOutputPath(opts, variant.fSuffix),
+                                   variant, opts.fQuiet, ResolveAutoMinGainPct(opts), ResolveAutoMaxLevel(opts),
+                                   ResolveAutoCodecs(opts), opts.fProfile, opts.fProfileId, opts.fNoOut,
+                                   opts.fVerify)) {
+         results.push_back(*row);
+      }
+   }
    return results;
 }
 
 #if !defined(_WIN32)
-void AppendOpt(std::vector<std::string> &args, const char *flag, const std::string &value)
-{
-   args.emplace_back(flag);
-   args.push_back(value);
-}
-
-std::vector<std::string>
-BuildWorkerArgv(const char *executable, const RunOptions &opts, const Variant &variant, const std::string &resultPath)
+std::vector<std::string> BuildWorkerArgv(const char *executable, const RunOptions &opts, const Variant &variant,
+                                         const std::string &resultPath)
 {
    std::vector<std::string> args;
    args.emplace_back(executable);
-   AppendOpt(args, "--only-variant", variant.fLabel);
-   AppendOpt(args, "--worker-result", resultPath);
+   args.emplace_back("--only-variant");
+   args.push_back(variant.fLabel);
+   args.emplace_back("--worker-result");
+   args.push_back(resultPath);
    args.emplace_back("--quiet");
-   if (opts.fLevelExplicit)
-      AppendOpt(args, "--level", std::to_string(opts.fLevel));
-   if (opts.fPageSize)
-      AppendOpt(args, "--page-size", std::to_string(*opts.fPageSize));
-   if (opts.fInitialPageSize)
-      AppendOpt(args, "--initial-page-size", std::to_string(*opts.fInitialPageSize));
-   if (opts.fNoOut)
-      args.emplace_back("--no-out");
+   if (opts.fKeepColumnEncoding)
+      args.emplace_back("--keep-column-encoding");
+   AppendLevelArgs(args, opts);
+   AppendPageSizeArgs(args, opts);
+   AppendAutoMinGainArgs(args, opts);
+   AppendAutoMaxLevelArgs(args, opts);
+   AppendAutoCodecsArgs(args, opts);
+   AppendProfileArgs(args, opts);
+   AppendNoOutArgs(args, opts);
+   AppendVerifyArgs(args, opts);
    args.push_back(opts.fInputFile);
    args.push_back(opts.fTreeName);
    args.push_back(opts.fOutputBase);
@@ -734,11 +1440,11 @@ BuildWorkerArgv(const char *executable, const RunOptions &opts, const Variant &v
 unsigned ResolveJobCount(int jobs, std::size_t numVariants)
 {
    if (jobs == 0) {
-      unsigned hw = std::thread::hardware_concurrency();
-      if (hw == 0)
-         hw = 1;
+      const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
       return static_cast<unsigned>(std::min<std::size_t>(hw, numVariants));
    }
+   if (jobs < 0)
+      throw std::runtime_error("--jobs must be >= 0");
    return static_cast<unsigned>(std::min<std::size_t>(static_cast<std::size_t>(jobs), numVariants));
 }
 
@@ -746,13 +1452,14 @@ std::vector<VariantResult> RunParallel(const RunOptions &opts, const char *execu
 {
    const auto variants = MakeVariants(opts);
    const unsigned jobCount = ResolveJobCount(opts.fJobs, variants.size());
-   if (jobCount <= 1) {
-      ROOT::EnableImplicitMT();
+   if (jobCount <= 1)
       return RunSequential(opts);
-   }
 
-   std::cout << "Running " << variants.size() << " variants with up to " << jobCount << " parallel jobs\n";
-   const std::string resultDir = std::string("/tmp/tree2ntuple-") + std::to_string(static_cast<long long>(getpid()));
+   std::cout << "Running " << variants.size() << " variants with up to " << jobCount
+             << " parallel jobs (one process per format)\n";
+
+   const std::string resultDir =
+      std::string("/tmp/tree2ntuple-") + std::to_string(static_cast<long long>(getpid()));
    gSystem->mkdir(resultDir.c_str(), true);
 
    struct RunningJob {
@@ -762,6 +1469,7 @@ std::vector<VariantResult> RunParallel(const RunOptions &opts, const char *execu
    };
 
    std::vector<RunningJob> running;
+   running.reserve(jobCount);
    std::vector<VariantResult> results;
    results.reserve(variants.size());
    std::size_t nextVariant = 0;
@@ -772,10 +1480,12 @@ std::vector<VariantResult> RunParallel(const RunOptions &opts, const char *execu
       const pid_t done = wait(&status);
       if (done <= 0)
          throw std::runtime_error("wait() failed while collecting parallel workers");
-      auto it =
-         std::find_if(running.begin(), running.end(), [done](const RunningJob &job) { return job.fPid == done; });
+
+      auto it = std::find_if(running.begin(), running.end(),
+                             [done](const RunningJob &job) { return job.fPid == done; });
       if (it == running.end())
          throw std::runtime_error("unexpected worker pid " + std::to_string(done));
+
       if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
          std::cerr << "Worker failed for variant " << it->fLabel << '\n';
          ++failedWorkers;
@@ -791,25 +1501,31 @@ std::vector<VariantResult> RunParallel(const RunOptions &opts, const char *execu
       job.fLabel = variant.fLabel;
       job.fResultPath = resultDir + "/" + variant.fLabel + ".result";
       RemoveIfExists(job.fResultPath);
-      const auto workerArgs = BuildWorkerArgv(executable, opts, variant, job.fResultPath);
-      std::cout.flush();
-      std::cerr.flush();
+
       const pid_t pid = fork();
       if (pid < 0)
          throw std::runtime_error(std::string("fork() failed for variant ") + variant.fLabel);
-      if (pid == 0)
+
+      if (pid == 0) {
+         const auto workerArgs = BuildWorkerArgv(executable, opts, variant, job.fResultPath);
          ExecWorker(workerArgs);
+      }
+
       job.fPid = pid;
       running.push_back(std::move(job));
    };
 
    while (nextVariant < variants.size() || !running.empty()) {
-      while (running.size() < jobCount && nextVariant < variants.size())
-         launchOne(variants[nextVariant++]);
+      while (running.size() < jobCount && nextVariant < variants.size()) {
+         launchOne(variants[nextVariant]);
+         ++nextVariant;
+      }
       if (!running.empty())
          reapOne();
    }
+
    gSystem->Unlink(resultDir.c_str());
+
    if (failedWorkers > 0)
       throw std::runtime_error(std::to_string(failedWorkers) + " parallel worker(s) failed");
 
@@ -823,6 +1539,7 @@ std::vector<VariantResult> RunParallel(const RunOptions &opts, const char *execu
       };
       return rank(a.fLabel) < rank(b.fLabel);
    });
+
    return results;
 }
 #endif
@@ -830,28 +1547,29 @@ std::vector<VariantResult> RunParallel(const RunOptions &opts, const char *execu
 int RunWorkerMode(const RunOptions &opts)
 {
    const auto variants = MakeVariants(opts);
-   if (variants.size() != 1)
-      throw std::runtime_error("--worker-result requires exactly one variant");
-   ROOT::EnableImplicitMT();
-   const auto result = ImportVariant(opts, variants[0], true);
-   WriteWorkerResult(opts.fWorkerResult, result);
-   return 0;
-}
+   const Variant *variant = FindVariant(variants, opts.fOnlyVariant);
+   if (!variant)
+      throw std::runtime_error("unknown variant label: " + opts.fOnlyVariant);
 
-void RunBench(const RunOptions &opts, const std::vector<VariantResult> &results)
-{
-   const auto variants = MakeVariants(opts);
-   std::vector<RNTupleBench::BenchmarkResult> benchResults;
-   for (const auto &row : results) {
-      const auto it = std::find_if(variants.begin(), variants.end(),
-                                   [&row](const Variant &variant) { return variant.fLabel == row.fLabel; });
-      if (it == variants.end())
-         continue;
-      const std::string path = opts.fOutputBase + it->fSuffix + ".root";
-      benchResults.push_back(RNTupleBench::RunBenchmarkForFile(
-         row.fLabel, path, "", opts.fBenchThreads, opts.fBenchIters, opts.fBenchEntries, opts.fBenchPercent));
+   ROOT::EnableImplicitMT();
+
+   const bool quiet = !opts.fWorkerResult.empty();
+   auto result = ImportVariant(opts.fInputFile, opts.fTreeName, ResolveVariantOutputPath(opts, variant->fSuffix),
+                               *variant, quiet, ResolveAutoMinGainPct(opts), ResolveAutoMaxLevel(opts),
+                               ResolveAutoCodecs(opts), opts.fProfile, opts.fProfileId, opts.fNoOut,
+                               opts.fVerify);
+   if (!result)
+      return 1;
+
+   if (!opts.fWorkerResult.empty()) {
+      WriteWorkerResult(opts.fWorkerResult, *result);
+      return 0;
    }
-   RNTupleBench::PrintBenchmarkSummary(benchResults);
+
+   const auto inputSize = FileSizeBytes(opts.fInputFile);
+   if (inputSize)
+      PrintSummaryTable(opts, *inputSize, {*result});
+   return 0;
 }
 
 int RunMain(const RunOptions &opts, const char *executable)
@@ -863,14 +1581,25 @@ int RunMain(const RunOptions &opts, const char *executable)
    if (!inputSize)
       throw std::runtime_error("cannot stat input file: " + opts.fInputFile);
 
-   if (!opts.fQuiet) {
-      std::cout << "Input: " << opts.fInputFile << " [" << opts.fTreeName << "]\n";
+   if (opts.fKeepColumnEncoding && !opts.fQuiet)
+      std::cout << "Using ROOT column encodings + spectra8 backend for Spectra8 variants\n";
+   if ((opts.fPageSize || opts.fInitialPageSize) && !opts.fQuiet)
       std::cout << "Page size: " << FormatPageSizeSettings(opts) << '\n';
-   }
+   if (!opts.fQuiet)
+      std::cout << "Spectra8 level: " << opts.fLevel << '\n';
+   if (!opts.fQuiet)
+      std::cout << "Auto min gain: " << ResolveAutoMinGainPct(opts) << "%\n";
+   if (ResolveAutoMaxLevel(opts) && !opts.fQuiet)
+      std::cout << "Auto max level: on\n";
+   if (!opts.fQuiet)
+      std::cout << "Auto codecs: " << FormatAutoCodecMask(ResolveAutoCodecs(opts)) << '\n';
+   if (!opts.fQuiet)
+      std::cout << "Crystal: " << FormatCrystalProfileStatus(opts) << '\n';
+   if (opts.fVerify && !opts.fQuiet)
+      std::cout << "Verify: enabled (compress/decompress round-trip per page)\n";
 
    std::vector<VariantResult> results;
 #if defined(_WIN32)
-   (void)executable;
    if (opts.fJobs != 1 && !opts.fQuiet)
       std::cerr << "tree2ntuple: parallel mode is not supported on Windows; running sequentially\n";
    ROOT::EnableImplicitMT();
@@ -886,12 +1615,31 @@ int RunMain(const RunOptions &opts, const char *executable)
 
    if (!opts.fQuiet)
       PrintSummaryTable(opts, *inputSize, results);
-   if (opts.fBench && !opts.fNoOut)
-      RunBench(opts, results);
+
+   if (opts.fBench && !opts.fNoOut) {
+      const auto variants = MakeVariants(opts);
+      std::vector<std::pair<std::string, std::string>> filesToBench;
+      for (const auto &row : results) {
+         const auto *v = FindVariant(variants, row.fLabel);
+         if (v) {
+            std::string outPath = ResolveVariantOutputPath(opts, v->fSuffix);
+            filesToBench.push_back({row.fLabel, outPath});
+         }
+      }
+      std::vector<RNTupleBench::BenchmarkResult> benchResults;
+      for (const auto &[label, path] : filesToBench) {
+         benchResults.push_back(RNTupleBench::RunBenchmarkForFile(
+            label, path, "", opts.fBenchThreads, opts.fBenchIters, opts.fBenchEntries, opts.fBenchPercent));
+      }
+      RNTupleBench::PrintBenchmarkSummary(benchResults);
+   }
+
    return 0;
 }
 
-int RunProgram(int argc, char **argv)
+} // anonymous namespace
+
+int main(int argc, char **argv)
 {
    try {
       const auto opts = ParseArgs(argc, argv);
@@ -901,11 +1649,4 @@ int RunProgram(int argc, char **argv)
       std::cerr << kUsage;
       return 1;
    }
-}
-
-} // namespace
-
-int main(int argc, char **argv)
-{
-   return RunProgram(argc, argv);
 }

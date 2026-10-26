@@ -37,14 +37,13 @@ using ROOT::Internal::RNTupleDecompressor;
 constexpr const char *kUsage = R"(Usage: rntupleinspect [options] input.root [ntupleName]
 
 Inspect an RNTuple's on-disk column types and estimate whether a stronger
-native page compressor (a higher zstd level, or lzma) can still shrink the
-file.
+page compressor (Spectra8 Crystal/Laser/Grating, or a higher zstd level) can
+still shrink the file.
 
 The tool samples packed pages, measures byte-plane entropy, and compares
 that Shannon limit with the size already stored by the file's compressor.
-High-entropy SplitReal32 mantissa planes are a floor: a stronger native
-compressor will not move them. Integer and offset columns are often already
-spent.
+High-entropy SplitReal32 mantissa planes are a floor: new codecs will not
+move them. Integer and offset columns are often already spent.
 
 Options:
   --top N         Rank the N largest on-disk columns (default: 20).
@@ -61,22 +60,9 @@ block page inspection. To actually recompress pages without CMSSW dictionaries,
 use rntupletryzip.
 )";
 
-enum class Kind {
-   kFloat,
-   kInt,
-   kIndex,
-   kBit,
-   kText,
-   kOther
-};
+enum class Kind { kFloat, kInt, kIndex, kBit, kText, kOther };
 
-enum class Headroom {
-   kNone,
-   kLow,
-   kMedium,
-   kHigh,
-   kUnknown
-};
+enum class Headroom { kNone, kLow, kMedium, kHigh, kUnknown };
 
 struct RunOptions {
    std::string fInputFile;
@@ -100,10 +86,10 @@ struct ColRow {
    std::uint64_t fComp = 0;
    std::uint64_t fUncomp = 0;
    int fSampledPages = 0;
-   double fEntropy = -1;    ///< mean packed-byte entropy, bits/byte
-   double fLsbEntropy = -1; ///< least-significant byte plane
-   double fMsbEntropy = -1; ///< most-significant byte plane
-   double fHeadroom = -1;   ///< residual vs 0th-order plane Shannon, as fraction of packed bytes
+   double fEntropy = -1;     ///< mean packed-byte entropy, bits/byte
+   double fLsbEntropy = -1;  ///< least-significant byte plane
+   double fMsbEntropy = -1;  ///< most-significant byte plane
+   double fHeadroom = -1;    ///< residual vs 0th-order plane Shannon, as fraction of packed bytes
    Headroom fVerdict = Headroom::kUnknown;
    std::string fAdvice;
 };
@@ -348,12 +334,12 @@ std::string Advise(const ColRow &c)
 
    if (c.fKind == Kind::kFloat) {
       if (c.fVerdict == Headroom::kNone && c.fLsbEntropy > 7.5)
-         return "mantissa floor; a stronger level will not shrink this";
+         return "mantissa floor; Spectra8 will not shrink this";
       if (c.fVerdict == Headroom::kNone)
-         return "already at the split+compressor floor";
+         return "already at split+zstd floor";
       if (c.fVerdict == Headroom::kLow)
-         return "try a higher zstd level or lzma";
-      return "try lzma on these float pages";
+         return "Crystal float profile, maybe a few %";
+      return "Crystal / Laser on float pages";
    }
    if (c.fKind == Kind::kInt) {
       if (c.fVerdict == Headroom::kNone && c.fEntropy > 7.0)
@@ -361,19 +347,19 @@ std::string Advise(const ColRow &c)
       if (c.fComp < 4096 || ratio > 8 || c.fVerdict == Headroom::kNone)
          return "already packed; ignore for file size";
       if (c.fVerdict == Headroom::kHigh || (c.fMsbEntropy >= 0 && c.fMsbEntropy < 1.0))
-         return "try lzma on integer pages";
-      return "try a higher zstd level or lzma";
+         return "Grating or Crystal poisson";
+      return "Grating / Crystal on integer pages";
    }
    if (c.fKind == Kind::kIndex) {
       if (ratio > 20)
          return "offset columns already spent";
-      return "split index with zstd is enough";
+      return "keep split index; zstd/delta is enough";
    }
    if (c.fKind == Kind::kText)
-      return "try lzma or a higher zstd level";
+      return "Prism / Mosaic / BWT";
    if (c.fKind == Kind::kBit)
       return "bit columns already packed";
-   return "compare native compressors with rntupletryzip";
+   return "measure with --auto-codecs all";
 }
 
 RunOptions ParseArgs(int argc, char **argv)
@@ -507,7 +493,8 @@ void SampleColumn(ColRow &col, const ROOT::RNTupleDescriptor &desc, PageReader &
          if (loc.GetType() == ROOT::RNTupleLocator::kTypePageZero)
             continue;
          const auto sealedBytes = loc.GetNBytesOnStorage();
-         const auto packedBytes = (static_cast<std::size_t>(col.fBits) * pageInfo.GetNElements() + 7) / 8;
+         const auto packedBytes =
+            (static_cast<std::size_t>(col.fBits) * pageInfo.GetNElements() + 7) / 8;
          if (sealedBytes == 0 || packedBytes == 0)
             continue;
 
@@ -600,9 +587,9 @@ int main(int argc, char **argv)
       std::cout << "Entries:  " << desc.GetNEntries() << "   clusters: " << desc.GetNClusters()
                 << "   columns: " << desc.GetNPhysicalColumns() << '\n';
       std::cout << "Pages:    " << inspector->GetCompressionSettingsAsString() << "   payload "
-                << FormatBytes(inspector->GetCompressedSize()) << " / " << FormatBytes(inspector->GetUncompressedSize())
-                << " uncompressed  (" << std::fixed << std::setprecision(2) << inspector->GetCompressionFactor()
-                << "x)\n\n";
+                << FormatBytes(inspector->GetCompressedSize()) << " / "
+                << FormatBytes(inspector->GetUncompressedSize()) << " uncompressed  (" << std::fixed
+                << std::setprecision(2) << inspector->GetCompressionFactor() << "x)\n\n";
 
       std::cout << "=== on-disk column types ===\n";
       inspector->PrintColumnTypeInfo();
@@ -716,24 +703,24 @@ int main(int argc, char **argv)
                    << std::setprecision(1) << std::fixed << spentPct << "% of payload).\n";
          if (spentPct >= 75 && byKind[static_cast<int>(Kind::kFloat)].comp > totComp / 2) {
             std::cout << "Verdict: little headroom. File size is dominated by high-entropy "
-                         "SplitReal32 kinematics; a higher zstd level or lzma will not move it.\n";
+                         "SplitReal32 kinematics; Laser/Crystal/Grating will not move it.\n";
          } else if (nHigh > 0 && byKind[static_cast<int>(Kind::kInt)].comp > totComp * 0.15) {
-            std::cout << "Verdict: integer pages still have room. Try lzma on the int columns; "
-                         "leave the float kinematics alone.\n";
+            std::cout << "Verdict: integer pages still have room. Try Grating or Crystal poisson "
+                         "on the int columns; leave the float kinematics alone.\n";
          } else if (nMed + nHigh > 0) {
-            std::cout << "Verdict: mixed. Measure with rntupletryzip; "
+            std::cout << "Verdict: mixed. Measure with rntuple2rntuple --auto-codecs all; "
                          "expect gains only on the medium/high columns below.\n";
          } else {
-            std::cout << "Verdict: remaining columns are already well packed. Another native "
-                         "compressor is unlikely to beat the current page compressor.\n";
+            std::cout << "Verdict: remaining columns are already well packed. A new codec is "
+                         "unlikely to beat the current page compressor.\n";
          }
       }
       std::cout << '\n';
 
       std::cout << "=== largest on-disk columns ===\n";
       std::cout << std::left << std::setw(36) << "field" << std::setw(14) << "type" << std::right << std::setw(11)
-                << "on disk" << std::setw(7) << "ratio" << std::setw(6) << "H" << std::setw(8) << "room" << std::left
-                << "  advice" << '\n';
+                << "on disk" << std::setw(7) << "ratio" << std::setw(6) << "H" << std::setw(8) << "room"
+                << std::left << "  advice" << '\n';
       for (int i = 0; i < nRank; ++i) {
          const auto &c = cols[i];
          const double ratio = c.fComp ? static_cast<double>(c.fUncomp) / c.fComp : 0;

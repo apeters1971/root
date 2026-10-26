@@ -65,4 +65,6 @@
 
 #@hasgeom@ R__HAS_GEOM /**/
 
+#@hasspectra8@ R__HAS_SPECTRA8 /**/
+
 #endif

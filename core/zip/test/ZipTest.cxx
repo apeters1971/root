@@ -68,3 +68,10 @@ TEST(RZip, ZipBufferSizesZSTD)
 {
    testZipBufferSizes(ROOT::RCompressionSetting::EAlgorithm::kZSTD);
 }
+
+#ifdef R__HAS_SPECTRA8
+TEST(RZip, ZipBufferSizesSpectra8)
+{
+   testZipBufferSizes(ROOT::RCompressionSetting::EAlgorithm::kSpectra8);
+}
+#endif

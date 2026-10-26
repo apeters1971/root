@@ -34,6 +34,10 @@
 #include <Compression.h>
 #include <TError.h>
 
+#ifdef R__HAS_SPECTRA8
+#include "ZipSpectra8.h"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -829,9 +833,74 @@ ROOT::Internal::RPageSink::RPageSink(std::string_view name, const ROOT::RNTupleW
    : RPageStorage(name), fOptions(options.Clone()), fWritePageMemoryManager(options.GetPageBufferBudget())
 {
    ROOT::Internal::EnsureValidNameForRNTuple(name, "RNTuple").ThrowOnError();
+
+#ifdef R__HAS_SPECTRA8
+   if (!fOptions->GetEnableColumnEncoding()) {
+      const auto algorithm = ROOT::RCompressionSetting::AlgorithmFromCompressionSettings(fOptions->GetCompression());
+      if (algorithm == ROOT::RCompressionSetting::EAlgorithm::kSpectra8)
+         R__SetSpectra8Filters(1);
+   }
+#endif
 }
 
 ROOT::Internal::RPageSink::~RPageSink() {}
+
+#ifdef R__HAS_SPECTRA8
+namespace {
+
+/// Pretrained Crystal profile for one column layout. Stride-4 models match 32-bit
+/// columns; text matches byte columns. Other layouts stay on the dynamic model.
+int Spectra8ProfileForColumnType(ROOT::ENTupleColumnType type)
+{
+   switch (type) {
+   case ROOT::ENTupleColumnType::kReal32:
+      return kSpectra8ProfileFloatKinematics;
+   case ROOT::ENTupleColumnType::kIndex32:
+   case ROOT::ENTupleColumnType::kUInt32:
+      return kSpectra8ProfilePoissonCounts;
+   case ROOT::ENTupleColumnType::kChar:
+      return kSpectra8ProfileText;
+   default:
+      return kSpectra8ProfileNone;
+   }
+}
+
+/// Sets the zip profile for this thread and restores it when the page seal returns.
+struct Spectra8CallProfileGuard {
+   int fPrevious{-1};
+   bool fActive{false};
+   explicit Spectra8CallProfileGuard(int profile)
+   {
+      if (profile < 0)
+         return;
+      fPrevious = R__GetSpectra8CallProfile();
+      R__SetSpectra8CallProfile(profile);
+      fActive = true;
+   }
+   ~Spectra8CallProfileGuard()
+   {
+      if (fActive)
+         R__SetSpectra8CallProfile(fPrevious);
+   }
+   Spectra8CallProfileGuard(const Spectra8CallProfileGuard &) = delete;
+   Spectra8CallProfileGuard &operator=(const Spectra8CallProfileGuard &) = delete;
+};
+
+/// Column profile for the profile flavour. Standard Crystal leaves this inactive so
+/// byte filters and the dynamic model stay in use.
+int Spectra8CallProfileForPage(const ROOT::Internal::RColumnElementBase &element, std::uint32_t compressionSettings)
+{
+   if (!R__GetSpectra8ProfilePerColumn() || R__GetSpectra8Codec() != kSpectra8CodecCrystal ||
+       R__GetSpectra8Profile() != kSpectra8ProfileNone)
+      return -1;
+   const auto algorithm = ROOT::RCompressionSetting::AlgorithmFromCompressionSettings(compressionSettings);
+   if (algorithm != ROOT::RCompressionSetting::EAlgorithm::kSpectra8)
+      return -1;
+   return Spectra8ProfileForColumnType(element.GetIdentifier().fOnDiskType);
+}
+
+} // namespace
+#endif
 
 ROOT::Internal::RPageStorage::RSealedPage ROOT::Internal::RPageSink::SealPage(const RSealPageConfig &config)
 {
@@ -852,6 +921,9 @@ ROOT::Internal::RPageStorage::RSealedPage ROOT::Internal::RPageSink::SealPage(co
    }
    auto nBytesZipped = nBytesPacked;
 
+#ifdef R__HAS_SPECTRA8
+   Spectra8CallProfileGuard columnProfile(Spectra8CallProfileForPage(*config.fElement, config.fCompressionSettings));
+#endif
    if ((config.fCompressionSettings != 0) || !config.fElement->IsMappable() || !config.fAllowAlias ||
        config.fWriteChecksum) {
       nBytesZipped =
@@ -1104,10 +1176,13 @@ void ROOT::Internal::RPagePersistentSink::InitImpl(ROOT::RNTupleModel &model)
 }
 
 std::unique_ptr<ROOT::RNTupleModel>
-ROOT::Internal::RPagePersistentSink::InitFromDescriptor(const ROOT::RNTupleDescriptor &srcDescriptor, bool copyClusters)
+ROOT::Internal::RPagePersistentSink::InitFromDescriptor(const ROOT::RNTupleDescriptor &srcDescriptor, bool copyClusters,
+                                                        bool dropColumnEncoding)
 {
    // Create new descriptor
    fDescriptorBuilder.SetSchemaFromExisting(srcDescriptor);
+   if (dropColumnEncoding)
+      fDescriptorBuilder.DemoteSplitColumnTypes();
    // This is needed to be able to use GetTypeNameForComparison()
    fDescriptorBuilder.SetVersionForWriting();
    const auto &descriptor = fDescriptorBuilder.GetDescriptor();
@@ -1152,15 +1227,18 @@ ROOT::Internal::RPagePersistentSink::InitFromDescriptor(const ROOT::RNTupleDescr
       }
    }
 
-   // Create model
-   auto modelOpts = ROOT::RNTupleDescriptor::RCreateModelOptions();
-   modelOpts.SetReconstructProjections(true);
-   // We want to emulate unknown types to allow merging RNTuples containing types that we lack dictionaries for.
-   modelOpts.SetEmulateUnknownTypes(true);
-   auto model = descriptor.CreateModel(modelOpts);
-   if (!copyClusters) {
-      auto &projectedFields = ROOT::Internal::GetProjectedFieldsOfModel(*model);
-      projectedFields.GetFieldZero().SetOnDiskId(model->GetConstFieldZero().GetOnDiskId());
+   // Recode-without-model skips C++ field reconstruction (streamer fields would otherwise need dictionaries).
+   std::unique_ptr<ROOT::RNTupleModel> model;
+   if (!dropColumnEncoding) {
+      auto modelOpts = ROOT::RNTupleDescriptor::RCreateModelOptions();
+      modelOpts.SetReconstructProjections(true);
+      // We want to emulate unknown types to allow merging RNTuples containing types that we lack dictionaries for.
+      modelOpts.SetEmulateUnknownTypes(true);
+      model = descriptor.CreateModel(modelOpts);
+      if (!copyClusters) {
+         auto &projectedFields = ROOT::Internal::GetProjectedFieldsOfModel(*model);
+         projectedFields.GetFieldZero().SetOnDiskId(model->GetConstFieldZero().GetOnDiskId());
+      }
    }
 
    // Serialize header and init from it

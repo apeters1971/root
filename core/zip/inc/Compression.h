@@ -42,6 +42,12 @@ namespace ROOT {
 ///   [207 - 208]
 ///  - LZ4 is recommended to be used with compression level 4 [404]
 ///  - ZSTD is recommended to be used with compression level 5 [505]
+///  - Spectra8 is recommended to be used with compression level 5 [605]
+///  - Spectra8 backends (Beam, Bwt, Zstd, Bzip3, Lzma, Auto, Mosaic, Oracle, Crystal)
+///    and filter / Auto-mask / Crystal profile options are toggled globally via
+///    R__SetSpectra8Codec(), R__SetSpectra8Filters(), R__SetSpectra8AutoCodecs(),
+///    R__SetSpectra8Profile(), and related helpers before
+///    compression (see ZipSpectra8.h). Decompression auto-detects the inner frame type.
 
 struct RCompressionSetting {
    struct EDefaults { /// Note: this is only temporarily a struct and will become a enum class hence the name convention
@@ -80,7 +86,9 @@ struct RCompressionSetting {
          /// Compression level reserved for old ROOT compression algorithm
          kDefaultOld = 6,
          /// Compression level reserved for LZMA compression algorithm (slowest compression with smallest files)
-         kDefaultLZMA = 7
+         kDefaultLZMA = 7,
+         /// Compression level reserved for Spectra8 compression algorithm (Crystal)
+         kDefaultSpectra8 = 5
       };
    };
    struct EAlgorithm { /// Note: this is only temporarily a struct and will become a enum class hence the name
@@ -101,6 +109,8 @@ struct RCompressionSetting {
          kLZ4,
          /// Use ZSTD compression
          kZSTD,
+         /// Use Spectra8 compression
+         kSpectra8,
          /// Undefined compression algorithm (must be kept the last of the list in case a new algorithm is added).
          kUndefined
       };

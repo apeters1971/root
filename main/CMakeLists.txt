@@ -45,7 +45,7 @@ ROOT_EXECUTABLE(rootnb.exe nbmain.cxx LIBRARIES Core CMAKENOEXPORT)
 #---ReadSpeed-------------------------------------------------------------------------------------
 ROOT_EXECUTABLE(rootreadspeed src/readspeed.cxx LIBRARIES RIO Tree TreePlayer ReadSpeed CMAKENOEXPORT)
 
-#---RNTuple conversion and inspection tools (native compressors only)-----------------------------
+#---RNTuple conversion and inspection tools--------------------------------------------------------
 ROOT_EXECUTABLE(tree2ntuple src/tree2ntuple.cxx
                 LIBRARIES Core RIO Tree ROOTNTuple ROOTNTupleUtil CMAKENOEXPORT)
 

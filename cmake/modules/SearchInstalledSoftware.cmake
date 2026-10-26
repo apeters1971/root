@@ -404,6 +404,31 @@ if(builtin_lz4)
   add_subdirectory(builtins/lz4)
 endif()
 
+#---Check for SPECTRA8--------------------------------------------------------------
+set(SPECTRA8_SOURCE_DIR "" CACHE PATH
+    "Optional path to a spectra8 checkout; if empty and builtin_spectra8=ON, the source is git-cloned")
+
+if(spectra8)
+  if(builtin_spectra8)
+    list(APPEND ROOT_BUILTINS SPECTRA8)
+    add_subdirectory(builtins/spectra8)
+  else()
+    find_package(SPECTRA8 QUIET)
+    if(NOT SPECTRA8_FOUND)
+      if(NOT SPECTRA8_INSTALL_HELP)
+        set(SPECTRA8_INSTALL_HELP
+            "spectra8 was not found. Install spectra8-devel / brew tap apeters/spectra8, set -DSPECTRA8_ROOT, or use -Dbuiltin_spectra8=ON.")
+      endif()
+      message(FATAL_ERROR "${SPECTRA8_INSTALL_HELP}")
+    endif()
+    if(SPECTRA8_VERSION)
+      message(STATUS "Found SPECTRA8: ${SPECTRA8_LIBRARIES} (version ${SPECTRA8_VERSION})")
+    else()
+      message(STATUS "Found SPECTRA8: ${SPECTRA8_LIBRARIES}")
+    endif()
+  endif()
+endif()
+
 #---Check for X11 which is mandatory lib on Unix--------------------------------------
 if(x11)
   message(STATUS "Looking for X11")

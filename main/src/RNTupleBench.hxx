@@ -103,8 +103,8 @@ inline std::string FindFirstNTupleName(const std::string &path, const std::strin
    return "";
 }
 
-inline const ROOT::Experimental::Detail::RNTuplePerfCounter *
-FindCounter(const ROOT::Experimental::Detail::RNTupleMetrics &metrics, const std::string &name)
+inline const ROOT::Experimental::Detail::RNTuplePerfCounter *FindCounter(
+   const ROOT::Experimental::Detail::RNTupleMetrics &metrics, const std::string &name)
 {
    if (auto *c = metrics.GetCounter("RNTupleReader.RPageStorage." + name))
       return c;
@@ -132,14 +132,14 @@ inline std::uint64_t ScaledCount(std::uint64_t total, double percent)
    return std::min(n, total);
 }
 
-inline PageDecompResult
-RunPageDecompBenchmark(const std::string &path, const std::string &ntupleName, int iters = 5, double percent = 100.0)
+inline PageDecompResult RunPageDecompBenchmark(const std::string &path, const std::string &ntupleName, int iters = 5,
+                                              double percent = 100.0)
 {
    PageDecompResult res;
    if (iters < 1)
       iters = 1;
 
-   // Open the RNTuple so the descriptor is loaded before the pages are read.
+   // 1. Open reader to attach and register compression profiles (e.g. Spectra8 Crystal profile) in spectra8
    std::unique_ptr<ROOT::RNTupleReader> reader;
    try {
       reader = ROOT::RNTupleReader::Open(ntupleName, path);
@@ -255,8 +255,8 @@ RunPageDecompBenchmark(const std::string &path, const std::string &ntupleName, i
    for (const auto &p : pages) {
       if (p.fCompBuffer.size() < p.fUncompSize) {
          try {
-            ROOT::Internal::RNTupleDecompressor::Unzip(p.fCompBuffer.data(), p.fCompBuffer.size(), p.fUncompSize,
-                                                       outBuf.data());
+            ROOT::Internal::RNTupleDecompressor::Unzip(
+               p.fCompBuffer.data(), p.fCompBuffer.size(), p.fUncompSize, outBuf.data());
          } catch (...) {
             // Ignore corrupted or uncompressed pages during raw decomp
          }
@@ -271,8 +271,8 @@ RunPageDecompBenchmark(const std::string &path, const std::string &ntupleName, i
       for (const auto &p : pages) {
          if (p.fCompBuffer.size() < p.fUncompSize) {
             try {
-               ROOT::Internal::RNTupleDecompressor::Unzip(p.fCompBuffer.data(), p.fCompBuffer.size(), p.fUncompSize,
-                                                          outBuf.data());
+               ROOT::Internal::RNTupleDecompressor::Unzip(
+                  p.fCompBuffer.data(), p.fCompBuffer.size(), p.fUncompSize, outBuf.data());
             } catch (...) {
             }
          } else {
@@ -346,8 +346,8 @@ inline EventReaderResult RunEventReaderBenchmark(const std::string &path, const 
 }
 
 inline BenchmarkResult RunBenchmarkForFile(const std::string &label, const std::string &path,
-                                           const std::string &ntupleName, int multiThreads = 0, int iters = 5,
-                                           std::uint64_t maxEntries = 0, double benchPercent = 100.0)
+                                          const std::string &ntupleName, int multiThreads = 0, int iters = 5,
+                                          std::uint64_t maxEntries = 0, double benchPercent = 100.0)
 {
    if (multiThreads <= 0) {
       multiThreads = static_cast<int>(std::thread::hardware_concurrency());
@@ -433,9 +433,14 @@ inline void PrintBenchmarkSummary(const std::vector<BenchmarkResult> &results)
    // Table 1: Pure In-Memory Page Decompression (Algorithm Benchmark)
    // -------------------------------------------------------------------------
    std::cout << "\n=== Pure In-Memory Page Decompression Benchmark (Algorithm) ===\n";
-   std::cout << std::left << std::setw(kLabelWidth) << "Variant / File" << std::right << std::setw(14) << "Comp Size"
-             << std::setw(15) << "Uncomp Size" << std::setw(10) << "Pages" << std::setw(14) << "Pass Time"
-             << std::setw(18) << "Decomp Throughput" << std::setw(14) << "vs Baseline" << '\n';
+   std::cout << std::left << std::setw(kLabelWidth) << "Variant / File"
+             << std::right << std::setw(14) << "Comp Size"
+             << std::setw(15) << "Uncomp Size"
+             << std::setw(10) << "Pages"
+             << std::setw(14) << "Pass Time"
+             << std::setw(18) << "Decomp Throughput"
+             << std::setw(14) << "vs Baseline"
+             << '\n';
    std::cout << std::string(kLabelWidth + 14 + 15 + 10 + 14 + 18 + 14, '-') << '\n';
 
    double baseDecompMBs = 0.0;
@@ -456,9 +461,12 @@ inline void PrintBenchmarkSummary(const std::vector<BenchmarkResult> &results)
             ratioStr << "baseline";
          }
 
-         std::cout << std::setw(14) << FormatMB(compMB) << std::setw(15) << FormatMB(uncompMB) << std::setw(10)
-                   << r.fPageDecomp.fNumPages << std::setw(14) << FormatTime(r.fPageDecomp.fTimePerPassSec)
-                   << std::setw(18) << FormatSpeed(r.fPageDecomp.fDecompMBs) << std::setw(14) << ratioStr.str();
+         std::cout << std::setw(14) << FormatMB(compMB)
+                   << std::setw(15) << FormatMB(uncompMB)
+                   << std::setw(10) << r.fPageDecomp.fNumPages
+                   << std::setw(14) << FormatTime(r.fPageDecomp.fTimePerPassSec)
+                   << std::setw(18) << FormatSpeed(r.fPageDecomp.fDecompMBs)
+                   << std::setw(14) << ratioStr.str();
       } else {
          std::cout << " [Error: " << r.fPageDecomp.fError << "]";
       }
@@ -469,18 +477,24 @@ inline void PrintBenchmarkSummary(const std::vector<BenchmarkResult> &results)
    // Table 2: Single-Threaded Event Reader Benchmark (LoadEntry, 1 Thread)
    // -------------------------------------------------------------------------
    std::cout << "\n=== Single-Threaded RNTuple Event Reader (LoadEntry, 1 Thread) ===\n";
-   std::cout << std::left << std::setw(kLabelWidth) << "Variant / File" << std::right << std::setw(13) << "Read Wall"
-             << std::setw(15) << "Total MB/s" << std::setw(18) << "Entries / sec" << std::setw(14) << "Decomp Wall"
-             << std::setw(18) << "Decomp MB/s" << std::setw(10) << "Pages" << '\n';
+   std::cout << std::left << std::setw(kLabelWidth) << "Variant / File"
+             << std::right << std::setw(13) << "Read Wall"
+             << std::setw(15) << "Total MB/s"
+             << std::setw(18) << "Entries / sec"
+             << std::setw(14) << "Decomp Wall"
+             << std::setw(18) << "Decomp MB/s"
+             << std::setw(10) << "Pages"
+             << '\n';
    std::cout << std::string(kLabelWidth + 13 + 15 + 18 + 14 + 18 + 10, '-') << '\n';
 
    for (const auto &r : results) {
       std::cout << std::left << std::setw(kLabelWidth) << r.fLabel << std::right;
       if (r.fSingleCore.fValid) {
-         std::cout << std::setw(13) << FormatTime(r.fSingleCore.fReadWallSec) << std::setw(15)
-                   << FormatSpeed(r.fSingleCore.fTotalMBs) << std::setw(18)
-                   << FormatEntriesPerSec(r.fSingleCore.fEntriesSec) << std::setw(14)
-                   << FormatTime(r.fSingleCore.fDecompWallSec) << std::setw(18) << FormatSpeed(r.fSingleCore.fDecompMBs)
+         std::cout << std::setw(13) << FormatTime(r.fSingleCore.fReadWallSec)
+                   << std::setw(15) << FormatSpeed(r.fSingleCore.fTotalMBs)
+                   << std::setw(18) << FormatEntriesPerSec(r.fSingleCore.fEntriesSec)
+                   << std::setw(14) << FormatTime(r.fSingleCore.fDecompWallSec)
+                   << std::setw(18) << FormatSpeed(r.fSingleCore.fDecompMBs)
                    << std::setw(10) << r.fSingleCore.fPages;
       } else {
          std::cout << " [Error: " << r.fSingleCore.fError << "]";
@@ -493,9 +507,15 @@ inline void PrintBenchmarkSummary(const std::vector<BenchmarkResult> &results)
    // -------------------------------------------------------------------------
    int mtThreads = results[0].fMultiCore.fThreads;
    std::cout << "\n=== Multi-Threaded RNTuple Event Reader (LoadEntry, " << mtThreads << " Threads IMT) ===\n";
-   std::cout << std::left << std::setw(kLabelWidth) << "Variant / File" << std::right << std::setw(9) << "Threads"
-             << std::setw(13) << "Read Wall" << std::setw(15) << "Total MB/s" << std::setw(18) << "Entries / sec"
-             << std::setw(14) << "Decomp Wall" << std::setw(18) << "Decomp MB/s" << std::setw(12) << "Speedup" << '\n';
+   std::cout << std::left << std::setw(kLabelWidth) << "Variant / File"
+             << std::right << std::setw(9) << "Threads"
+             << std::setw(13) << "Read Wall"
+             << std::setw(15) << "Total MB/s"
+             << std::setw(18) << "Entries / sec"
+             << std::setw(14) << "Decomp Wall"
+             << std::setw(18) << "Decomp MB/s"
+             << std::setw(12) << "Speedup"
+             << '\n';
    std::cout << std::string(kLabelWidth + 9 + 13 + 15 + 18 + 14 + 18 + 12, '-') << '\n';
 
    for (const auto &r : results) {
@@ -509,10 +529,12 @@ inline void PrintBenchmarkSummary(const std::vector<BenchmarkResult> &results)
             speedupStr << "n/a";
          }
 
-         std::cout << std::setw(9) << r.fMultiCore.fThreads << std::setw(13) << FormatTime(r.fMultiCore.fReadWallSec)
-                   << std::setw(15) << FormatSpeed(r.fMultiCore.fTotalMBs) << std::setw(18)
-                   << FormatEntriesPerSec(r.fMultiCore.fEntriesSec) << std::setw(14)
-                   << FormatTime(r.fMultiCore.fDecompWallSec) << std::setw(18) << FormatSpeed(r.fMultiCore.fDecompMBs)
+         std::cout << std::setw(9) << r.fMultiCore.fThreads
+                   << std::setw(13) << FormatTime(r.fMultiCore.fReadWallSec)
+                   << std::setw(15) << FormatSpeed(r.fMultiCore.fTotalMBs)
+                   << std::setw(18) << FormatEntriesPerSec(r.fMultiCore.fEntriesSec)
+                   << std::setw(14) << FormatTime(r.fMultiCore.fDecompWallSec)
+                   << std::setw(18) << FormatSpeed(r.fMultiCore.fDecompMBs)
                    << std::setw(12) << speedupStr.str();
       } else {
          std::cout << " [Error: " << r.fMultiCore.fError << "]";
